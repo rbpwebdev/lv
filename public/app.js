@@ -80,11 +80,22 @@ function navigate(path, params = {}, { replace = false } = {}) {
   return applyRoute();
 }
 
+let leavingTimer = null;
+// Layar lama ditahan sebentar sambil memudar supaya perpindahan tidak terasa dihempas.
 function showTopSection(name) {
-  clearTimeout(state.adminTimer);
-  if (name !== 'viewer') { releaseFeed(); hideIntro(); }
-  $('#home').hidden = name !== 'landing'; $('#login').hidden = name !== 'login';
-  $('#viewer').hidden = name !== 'viewer'; $('#admin').hidden = name !== 'admin';
+  clearTimeout(state.adminTimer); clearTimeout(leavingTimer);
+  const sections = { landing: $('#home'), login: $('#login'), viewer: $('#viewer'), admin: $('#admin') };
+  const target = sections[name];
+  const leaving = Object.values(sections).find(node => !node.hidden && node !== target && !node.classList.contains('leaving'));
+  for (const node of Object.values(sections)) {
+    node.classList.remove('leaving');
+    if (node !== target && node !== leaving) node.hidden = true;
+  }
+  target.hidden = false;
+  const settle = () => { if ($('#viewer').hidden) { releaseFeed(); hideIntro(); } };
+  if (!leaving) return settle();
+  leaving.classList.add('leaving');
+  leavingTimer = setTimeout(() => { leaving.hidden = true; leaving.classList.remove('leaving'); settle(); }, 260);
 }
 
 async function applyRoute() {
@@ -148,7 +159,9 @@ async function showViewerHome() {
 
 async function showAdmin() {
   state.page = 1;
-  api('/api/settings').then(({ feedMode }) => { $('#feed-mode').value = feedMode; }).catch(() => {});
+  api('/api/settings')
+    .then(({ feedMode }) => { $('#feed-mode').value = feedMode; })
+    .catch(error => { $('#admin-status').textContent = `Setelan feed tidak terbaca: ${error.message}`; });
   await loadAdminVideos();
 }
 
@@ -612,6 +625,56 @@ function openMetadata(video) {
   $('#metadata-dialog').showModal();
 }
 
+const adminRows = new Map();
+
+function adminRow(video) {
+  const refs = { video };
+  const item = document.createElement('article'); item.className = 'admin-item';
+  const thumb = document.createElement('div'); thumb.className = 'admin-thumb';
+  const image = document.createElement('img'); image.alt = '';
+  const fallback = document.createElement('span'); fallback.textContent = 'LV';
+  const spinner = document.createElement('span'); spinner.className = 'admin-spinner';
+  thumb.append(image, fallback, spinner);
+  const info = document.createElement('div'); info.className = 'admin-info';
+  const name = document.createElement('strong');
+  const details = document.createElement('span');
+  const status = document.createElement('span');
+  info.append(name, details, status);
+  const actions = document.createElement('div'); actions.className = 'admin-actions';
+  const manage = document.createElement('button'); manage.textContent = 'Kelola'; actions.append(manage);
+  for (const node of [thumb, info, manage]) node.addEventListener('click', () => openMetadata(refs.video));
+  item.append(thumb, info, actions);
+  return Object.assign(refs, { item, thumb, image, fallback, name, details, status });
+}
+
+// Dipanggil tiap polling progres, jadi hanya bagian yang berubah yang disentuh —
+// membangun ulang seluruh baris bikin daftarnya berkedip.
+function fillAdminRow(refs, video) {
+  refs.video = video;
+  const working = video.ingestStatus === 'downloading' || video.conversionStatus === 'converting';
+  const text = video.ingestStatus === 'downloading' ? `Download ${video.ingestProgress ? `${video.ingestProgress}%` : '…'}`
+    : video.ingestStatus === 'failed' ? 'Download gagal'
+      : video.conversionStatus === 'converting' ? `Konversi ${video.conversionProgress}%`
+        : video.conversionStatus === 'failed' ? 'Konversi gagal'
+          : video.conversionStatus === 'converted' ? ''
+            : video.nativeTs ? 'Membaca TS' : 'unoptimised';
+  const className = `status status-${video.ingestStatus !== 'ready' ? video.ingestStatus : video.conversionStatus}`;
+  const detail = `${(video.categories || [video.category]).join(', ')} · ${formatTime(video.durationSeconds)} · ${formatBytes(video.sizeBytes)}`;
+  const progress = video.ingestStatus === 'downloading' ? video.ingestProgress : video.conversionProgress;
+  if (refs.name.textContent !== video.title) refs.name.textContent = video.title;
+  if (refs.details.textContent !== detail) refs.details.textContent = detail;
+  if (refs.status.textContent !== text) refs.status.textContent = text;
+  if (refs.status.className !== className) refs.status.className = className;
+  refs.status.hidden = !text;
+  refs.status.title = video.ingestError || video.conversionError || '';
+  if (refs.image.getAttribute('src') !== video.thumbnail) {
+    if (video.thumbnail) refs.image.src = video.thumbnail; else refs.image.removeAttribute('src');
+  }
+  refs.image.hidden = !video.thumbnail; refs.fallback.hidden = Boolean(video.thumbnail);
+  refs.thumb.classList.toggle('working', working);
+  refs.thumb.style.setProperty('--progress', `${Number(progress) || 0}%`);
+}
+
 function renderAdminList() {
   if (state.user?.role !== 'admin') return;
   $('#video-count').textContent = state.pagination?.total || 0;
@@ -620,24 +683,17 @@ function renderAdminList() {
   $('#page-prev').disabled = !state.pagination || state.pagination.page <= 1;
   $('#page-next').disabled = !state.pagination || state.pagination.page >= state.pagination.totalPages;
   $('#admin-empty').hidden = state.videos.length > 0;
-  $('#admin-list').replaceChildren(...state.videos.map(video => {
-    const item = document.createElement('article'); item.className = 'admin-item';
-    const thumb = document.createElement('div'); thumb.className = 'admin-thumb';
-    if (video.thumbnail) { const image = document.createElement('img'); image.src = video.thumbnail; image.alt = ''; thumb.append(image); }
-    else thumb.textContent = 'LV';
-    const info = document.createElement('div'); info.className = 'admin-info';
-    const name = document.createElement('strong'); name.textContent = video.title;
-    const details = document.createElement('span'); details.textContent = `${(video.categories || [video.category]).join(', ')} · ${formatTime(video.durationSeconds)} · ${formatBytes(video.sizeBytes)}`;
-    const status = document.createElement('span'); status.className = `status status-${video.ingestStatus !== 'ready' ? video.ingestStatus : video.conversionStatus}`;
-    status.textContent = video.ingestStatus === 'downloading' ? `Download ${video.ingestProgress ? `${video.ingestProgress}%` : '…'}` : video.ingestStatus === 'failed' ? 'Download gagal' : video.conversionStatus === 'converting' ? `Konversi ${video.conversionProgress}%` : video.conversionStatus === 'failed' ? 'Konversi gagal' : video.conversionStatus === 'converted' ? '' : video.nativeTs ? 'Membaca TS' : 'unoptimised';
-    status.hidden = !status.textContent;
-    if (video.ingestError || video.conversionError) status.title = video.ingestError || video.conversionError;
-    info.append(name, details, status);
-    const actions = document.createElement('div'); actions.className = 'admin-actions';
-    const manage = document.createElement('button'); manage.textContent = 'Kelola'; manage.addEventListener('click', () => openMetadata(video)); actions.append(manage);
-    thumb.addEventListener('click', () => openMetadata(video)); info.addEventListener('click', () => openMetadata(video));
-    item.append(thumb, info, actions); return item;
-  }));
+  const list = $('#admin-list');
+  const rows = state.videos.map(video => {
+    let refs = adminRows.get(video.id);
+    if (!refs) { refs = adminRow(video); adminRows.set(video.id, refs); }
+    fillAdminRow(refs, video);
+    return refs.item;
+  });
+  const shown = new Set(state.videos.map(video => video.id));
+  for (const id of adminRows.keys()) if (!shown.has(id)) adminRows.delete(id);
+  const current = list.children;
+  if (current.length !== rows.length || rows.some((node, index) => current[index] !== node)) list.replaceChildren(...rows);
 }
 
 $('#login-form').addEventListener('submit', async event => {
