@@ -1,0 +1,11 @@
+{
+  "name": "lv-private-video",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "setup-users": "node setup-users.js"
+  },
+  "engines": { "node": ">=22.5" },
+  "dependencies": { "hls.js": "1.7.0" }
+}

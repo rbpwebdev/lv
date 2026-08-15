@@ -1,0 +1,50 @@
+# Private runtime data and generated media
+/data/
+/uploads/
+/thumbnails/
+/hls/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.sql
+
+# Installed dependencies and build/cache output
+/node_modules/
+/dist/
+/coverage/
+/.cache/
+/.npm/
+
+# Environment files, credentials, and private keys
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_*
+.ssh/
+*credential*
+*secret*
+*token*
+
+# Logs, temporary files, and backups
+*.log
+*.pid
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.old
+*~
+.DS_Store
+/backups/
+
+# Local deployment files and environment-bound artifacts
+/index.html
+/test-media-e2e.js
+/lv.initd
+/nginx.conf
