@@ -1,13 +1,17 @@
 const $ = selector => document.querySelector(selector);
-const state = { user: null, videos: [], viewerPage: 1, viewerPagination: null, viewerCategory: '', viewerQuery: '', viewerSeed: 0, viewerLoading: false, viewerLoadId: 0, searchQuery: '', searchVideos: [], searchPage: 1, searchPagination: null, searchLoading: false, searchLoadId: 0, searchTimer: null, adminTimer: null, adminSearchTimer: null, adminLoadId: 0, adminFilters: { q: '', category: '', status: '', sort: 'newest' }, page: 1, pagination: null, manageVideo: null, uploadFile: null };
+const state = { user: null, videos: [], homeVideos: [], homePagination: null, homeLoadId: 0, viewerPage: 1, viewerPagination: null, viewerCategory: '', viewerQuery: '', viewerSeed: 0, viewerSince: 0, viewerStartId: 0, viewerLoading: false, viewerLoadId: 0, feedReady: false, feedIntroTimer: null, lapStart: 0, feedEnded: false, searchQuery: '', searchVideos: [], searchPage: 1, searchPagination: null, searchLoading: false, searchLoadId: 0, searchTimer: null, adminTimer: null, adminSearchTimer: null, adminLoadId: 0, adminFilters: { q: '', category: '', status: '', sort: 'newest' }, page: 1, pagination: null, manageVideo: null, uploadFile: null, route: '', muted: readStore('lv-muted') !== '0' };
+const reportedViews = new Set();
 const streams = new WeakMap();
 const feedVideos = new WeakMap();
+const playerActions = new WeakMap();
 let playbackObserver = null;
 let bufferObserver = null;
+let activePlayer = null;
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
   const body = await response.json().catch(() => ({}));
+  if (response.status === 401 && state.user) { state.user = null; navigate('/login', {}, { replace: true }); }
   if (!response.ok) throw new Error(body.error || 'Terjadi kesalahan.');
   return body;
 }
@@ -49,7 +53,7 @@ function releaseFeedStream(player) {
 
 function releaseFeed() {
   playbackObserver?.disconnect(); bufferObserver?.disconnect();
-  playbackObserver = null; bufferObserver = null;
+  playbackObserver = null; bufferObserver = null; activePlayer = null;
   document.querySelectorAll('#feed video').forEach(releaseFeedStream);
 }
 
@@ -58,39 +62,198 @@ function shuffleSeed() {
   return Math.floor(Math.random() * 1000000) + 1;
 }
 
-function showLogin() {
-  clearTimeout(state.adminTimer); releaseFeed();
-  $('#home').hidden = true; $('#viewer').hidden = true; $('#admin').hidden = true; $('#login').hidden = false; $('#username').focus();
+const viewerPaths = ['/home', '/watch', '/search', '/profile'];
+const appPaths = ['/', '/login', '/admin', ...viewerPaths];
+
+function landingPath() { return state.user?.role === 'admin' ? '/admin' : '/home'; }
+
+function buildUrl(path, params = {}) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) if (value !== '' && value !== null && value !== undefined) query.set(key, String(value));
+  const search = query.toString();
+  return search ? `${path}?${search}` : path;
 }
 
-async function showViewer(user) {
-  state.user = user; $('#home').hidden = true; $('#login').hidden = true; $('#admin').hidden = true; $('#viewer').hidden = false; await showWatch();
+function navigate(path, params = {}, { replace = false } = {}) {
+  const target = buildUrl(path, params);
+  if (target !== location.pathname + location.search) history[replace ? 'replaceState' : 'pushState'](null, '', target);
+  return applyRoute();
 }
 
-async function showAdmin(user) {
-  state.user = user; state.page = 1; $('#home').hidden = true; $('#login').hidden = true; $('#viewer').hidden = true; $('#admin').hidden = false; await loadAdminVideos();
+function showTopSection(name) {
+  clearTimeout(state.adminTimer);
+  if (name !== 'viewer') { releaseFeed(); hideIntro(); }
+  $('#home').hidden = name !== 'landing'; $('#login').hidden = name !== 'login';
+  $('#viewer').hidden = name !== 'viewer'; $('#admin').hidden = name !== 'admin';
 }
 
-function enterApp(user) { return user.role === 'admin' ? showAdmin(user) : showViewer(user); }
-
-function showHome() {
-  clearTimeout(state.adminTimer); releaseFeed();
-  $('#login').hidden = true; $('#viewer').hidden = true; $('#admin').hidden = true; $('#home').hidden = false;
-  const label = state.user?.role === 'admin' ? 'Ke Dasbor' : 'Ke Watch'; $('#home-enter').textContent = label; $('#home-primary').textContent = label;
+async function applyRoute() {
+  const path = location.pathname.replace(/(.)\/+$/, '$1');
+  const params = new URLSearchParams(location.search);
+  if (!appPaths.includes(path)) return navigate(state.user ? landingPath() : '/login', {}, { replace: true });
+  if (!state.user) {
+    if (path !== '/login') return navigate('/login', {}, { replace: true });
+    state.route = path; showTopSection('login'); $('#username').focus(); return;
+  }
+  if (path === '/login') return navigate(landingPath(), {}, { replace: true });
+  if (state.user.role === 'admin' && viewerPaths.includes(path)) return navigate('/admin', {}, { replace: true });
+  if (state.user.role !== 'admin' && path === '/admin') return navigate('/home', {}, { replace: true });
+  if (path === '/watch' && !params.get('seed')) {
+    params.set('seed', String(shuffleSeed()));
+    return navigate('/watch', Object.fromEntries(params), { replace: true });
+  }
+  const signature = `${path}?${params}`;
+  const sameRoute = signature === state.route;
+  state.route = signature;
+  if (path === '/') { showTopSection('landing'); return showLanding(); }
+  if (path === '/admin') { showTopSection('admin'); return showAdmin().catch(error => { $('#admin-status').textContent = error.message; }); }
+  showTopSection('viewer'); updateViewerIdentity();
+  if (path === '/home') return showViewerHome();
+  if (path === '/search') return showSearch(params.get('q') || '').catch(routeError);
+  if (path === '/profile') return showProfile();
+  return showWatch({
+    category: params.get('category') || '', query: params.get('q') || '',
+    seed: Number(params.get('seed')) || shuffleSeed(), startId: Number(params.get('v')) || 0, keepFeed: sameRoute
+  }).catch(error => { $('#empty').textContent = error.message; $('#empty').hidden = false; });
 }
 
-function control(label, title, className = '') {
+function selectViewerTab(tab) {
+  for (const name of ['home', 'watch', 'search', 'profile']) {
+    $(`#tab-${name}`).classList.toggle('active', name === tab);
+  }
+}
+
+function showViewerSection(section) {
+  $('#viewer-home-view').hidden = section !== 'home';
+  $('#feed').hidden = section !== 'watch';
+  $('#search-view').hidden = section !== 'search';
+  $('#profile-view').hidden = section !== 'profile';
+  if (section !== 'watch') { $('#empty').hidden = true; setPull(0); }
+  selectViewerTab(section);
+}
+
+function updateViewerIdentity() {
+  const username = state.user?.username || 'Pengguna';
+  const role = state.user?.role === 'admin' ? 'Administrator' : 'Pengguna';
+  $('#viewer-name').textContent = username;
+  $('#profile-name').textContent = username;
+  $('#profile-role').textContent = role;
+  $('#profile-avatar').textContent = username.trim().charAt(0).toUpperCase() || 'P';
+}
+
+async function showViewerHome() {
+  releaseFeed(); hideIntro(); showViewerSection('home');
+  await loadHomeVideos();
+}
+
+async function showAdmin() {
+  state.page = 1;
+  api('/api/settings').then(({ feedMode }) => { $('#feed-mode').value = feedMode; }).catch(() => {});
+  await loadAdminVideos();
+}
+
+function showLanding() {
+  const label = state.user?.role === 'admin' ? 'Ke Dasbor' : 'Ke Watch';
+  $('#home-enter').textContent = label; $('#home-primary').textContent = label;
+}
+
+const icons = {
+  back: '<path d="M2.5 4.5v5.5h5.5"/><path d="M4.6 15a8.5 8.5 0 1 0 1.9-8.9L2.5 10"/><text x="12.4" y="15.4">10</text>',
+  forward: '<path d="M21.5 4.5v5.5H16"/><path d="M19.4 15a8.5 8.5 0 1 1-1.9-8.9l4 3.9"/><text x="11.6" y="15.4">10</text>',
+  heart: '<path d="M20.3 5.3a5 5 0 0 0-7.1 0L12 6.5l-1.2-1.2a5 5 0 0 0-7.1 7.1l8.3 8.3 8.3-8.3a5 5 0 0 0 0-7.1Z"/>',
+  crop: '<path d="M6.5 2v13.5a2 2 0 0 0 2 2H22"/><path d="M2 6.5h13.5a2 2 0 0 1 2 2V22"/>',
+  fullscreen: '<path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>',
+  volume: '<path d="M11 5 6 9H2v6h4l5 4V5Z" class="solid"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/>',
+  mute: '<path d="M11 5 6 9H2v6h4l5 4V5Z" class="solid"/><path d="m16 9.5 5 5m0-5-5 5"/>',
+  play: '<path d="M7 4.5v15l13-7.5Z" class="solid"/>',
+  pause: '<path d="M9 4.5v15M15 4.5v15"/>'
+};
+
+function icon(name) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('aria-hidden', 'true');
+  svg.innerHTML = icons[name];
+  return svg;
+}
+
+function control(name, title, className = '') {
   const button = document.createElement('button');
-  button.type = 'button'; button.className = `player-button ${className}`; button.textContent = label; button.title = title;
+  button.type = 'button'; button.className = `player-button ${className}`.trim(); button.title = title; button.ariaLabel = title;
+  button.append(icon(name));
   return button;
+}
+
+function setMuted(muted) {
+  state.muted = muted; writeStore('lv-muted', muted ? '1' : '0');
+  for (const player of document.querySelectorAll('#feed video')) player.muted = muted;
+  for (const button of document.querySelectorAll('.sound-button')) button.replaceChildren(icon(muted ? 'mute' : 'volume'));
+}
+
+function playPlayer(player) {
+  return player.play().catch(() => { player.muted = true; return player.play().catch(() => {}); });
 }
 
 function makeCard(video) {
   const card = document.createElement('article'); card.className = 'video-card';
   const player = document.createElement('video');
-  player.loop = true; player.muted = true; player.playsInline = true; player.preload = 'auto';
+  player.loop = true; player.muted = state.muted; player.playsInline = true; player.preload = 'auto';
   feedVideos.set(player, video);
-  player.addEventListener('click', () => player.paused ? player.play() : player.pause());
+
+  const badge = document.createElement('span'); badge.className = 'tap-badge';
+  const buffer = document.createElement('span'); buffer.className = 'buffer-ring';
+  function flash(name, className = '') {
+    badge.className = `tap-badge ${className}`.trim(); badge.replaceChildren(icon(name));
+    void badge.offsetWidth; badge.classList.add('show');
+  }
+  function togglePlay() {
+    if (player.paused) { playPlayer(player); flash('play'); } else { player.pause(); flash('pause'); }
+  }
+  function seekBy(seconds) {
+    player.currentTime = Math.min(player.duration || Infinity, Math.max(0, player.currentTime + seconds));
+  }
+  async function setLike(next) {
+    if (next === video.liked) return;
+    const result = await api(`/api/videos/${video.id}/like`, { method: next ? 'POST' : 'DELETE' });
+    video.liked = result.liked; video.likeCount = result.likeCount;
+    love.classList.toggle('liked', video.liked); count.textContent = video.likeCount || '';
+  }
+
+  // Crop memakai object-fit: cover, jadi sisanya digeser lewat object-position.
+  const pan = { x: 50, y: 50 };
+  let drag = null; let panned = false;
+  function panLimits() {
+    if (!player.videoWidth || !player.classList.contains('crop')) return { x: 0, y: 0 };
+    const rect = player.getBoundingClientRect();
+    const scale = Math.max(rect.width / player.videoWidth, rect.height / player.videoHeight);
+    return { x: Math.max(0, player.videoWidth * scale - rect.width), y: Math.max(0, player.videoHeight * scale - rect.height) };
+  }
+  player.addEventListener('pointerdown', event => {
+    panned = false;
+    if (event.button || !player.classList.contains('crop')) return;
+    const limits = panLimits(); if (!limits.x && !limits.y) return;
+    drag = { x: event.clientX, y: event.clientY, px: pan.x, py: pan.y, limits };
+    player.setPointerCapture(event.pointerId);
+  });
+  player.addEventListener('pointermove', event => {
+    if (!drag) return;
+    const dx = event.clientX - drag.x; const dy = event.clientY - drag.y;
+    if (!panned && Math.hypot(dx, dy) < 6) return;
+    panned = true; player.classList.add('panning');
+    if (drag.limits.x) pan.x = Math.min(100, Math.max(0, drag.px - dx / drag.limits.x * 100));
+    if (drag.limits.y) pan.y = Math.min(100, Math.max(0, drag.py - dy / drag.limits.y * 100));
+    player.style.objectPosition = `${pan.x}% ${pan.y}%`;
+  });
+  for (const name of ['pointerup', 'pointercancel']) player.addEventListener(name, () => { drag = null; player.classList.remove('panning'); });
+
+  let lastTap = 0;
+  player.addEventListener('click', () => {
+    if (panned) { panned = false; return; }
+    const now = Date.now();
+    if (now - lastTap < 300) { lastTap = 0; togglePlay(); flash('heart', 'heart'); setLike(true).catch(() => {}); return; }
+    lastTap = now; togglePlay();
+  });
+  player.addEventListener('waiting', () => card.classList.add('buffering'));
+  for (const name of ['playing', 'canplay', 'pause']) player.addEventListener(name, () => card.classList.remove('buffering'));
 
   const meta = document.createElement('div'); meta.className = 'meta';
   const category = document.createElement('span'); category.className = 'category'; category.textContent = (video.categories || [video.category]).join(' · ');
@@ -99,55 +262,81 @@ function makeCard(video) {
   if (video.caption) { const caption = document.createElement('p'); caption.textContent = video.caption; meta.append(caption); }
 
   const seek = document.createElement('div'); seek.className = 'seek-controls';
-  const back = control('−10', 'Mundur 10 detik');
-  const forward = control('+10', 'Maju 10 detik');
-  back.addEventListener('click', event => { event.stopPropagation(); player.currentTime = Math.max(0, player.currentTime - 10); });
-  forward.addEventListener('click', event => { event.stopPropagation(); player.currentTime = Math.min(player.duration || Infinity, player.currentTime + 10); });
+  const back = control('back', 'Mundur 10 detik');
+  const forward = control('forward', 'Maju 10 detik');
+  back.addEventListener('click', event => { event.stopPropagation(); seekBy(-10); });
+  forward.addEventListener('click', event => { event.stopPropagation(); seekBy(10); });
   seek.append(back, forward);
 
   const rail = document.createElement('div'); rail.className = 'player-rail';
-  const love = control(video.liked ? '♥' : '♡', 'Love', video.liked ? 'liked' : '');
+  const love = control('heart', 'Love', video.liked ? 'liked' : '');
   const count = document.createElement('small'); count.textContent = video.likeCount || '';
   const loveWrap = document.createElement('span'); loveWrap.className = 'love-wrap'; loveWrap.append(love, count);
-  love.addEventListener('click', async event => {
+  love.addEventListener('click', event => { event.stopPropagation(); setLike(!video.liked).catch(() => {}); });
+  const crop = control('crop', 'Isi layar');
+  crop.addEventListener('click', event => {
     event.stopPropagation();
-    const next = !video.liked;
-    const result = await api(`/api/videos/${video.id}/like`, { method: next ? 'POST' : 'DELETE' });
-    video.liked = result.liked; video.likeCount = result.likeCount;
-    love.textContent = video.liked ? '♥' : '♡'; love.classList.toggle('liked', video.liked); count.textContent = video.likeCount || '';
+    const cropped = player.classList.toggle('crop'); crop.classList.toggle('active', cropped);
+    if (cropped) player.style.objectPosition = `${pan.x}% ${pan.y}%`; else player.style.removeProperty('object-position');
   });
-  const crop = control('▣', 'Fit / crop');
-  crop.addEventListener('click', event => { event.stopPropagation(); player.classList.toggle('crop'); crop.classList.toggle('active'); });
-  const fullscreen = control('⛶', 'Layar penuh');
+  const fullscreen = control('fullscreen', 'Layar penuh');
   fullscreen.addEventListener('click', event => {
     event.stopPropagation();
-    if (card.requestFullscreen) card.requestFullscreen(); else if (player.webkitEnterFullscreen) player.webkitEnterFullscreen();
+    if (document.fullscreenElement) document.exitFullscreen();
+    else if (card.requestFullscreen) card.requestFullscreen(); else if (player.webkitEnterFullscreen) player.webkitEnterFullscreen();
   });
-  const sound = control('◖', 'Suara');
-  sound.addEventListener('click', event => { event.stopPropagation(); player.muted = !player.muted; sound.textContent = player.muted ? '◖' : '♪'; });
+  const sound = control(state.muted ? 'mute' : 'volume', 'Suara', 'sound-button');
+  sound.addEventListener('click', event => { event.stopPropagation(); setMuted(!state.muted); });
   rail.append(loveWrap, crop, fullscreen, sound);
 
   const timeline = document.createElement('div'); timeline.className = 'timeline';
   const progress = document.createElement('input'); progress.type = 'range'; progress.min = '0'; progress.max = '1000'; progress.value = '0'; progress.ariaLabel = 'Posisi video';
   const clock = document.createElement('span'); clock.textContent = `0:00 / ${formatTime(video.durationSeconds)}`;
-  player.addEventListener('timeupdate', () => { if (player.duration) progress.value = String(player.currentTime / player.duration * 1000); clock.textContent = `${formatTime(player.currentTime)} / ${formatTime(player.duration)}`; });
-  progress.addEventListener('input', event => { event.stopPropagation(); if (player.duration) player.currentTime = Number(progress.value) / 1000 * player.duration; });
+  player.addEventListener('timeupdate', () => {
+    if (player.duration) {
+      const ratio = player.currentTime / player.duration;
+      progress.value = String(ratio * 1000); progress.style.setProperty('--progress', `${ratio * 100}%`);
+    }
+    clock.textContent = `${formatTime(player.currentTime)} / ${formatTime(player.duration)}`;
+    if (player.currentTime >= 2.5) reportView(video);
+  });
+  progress.addEventListener('input', event => {
+    event.stopPropagation();
+    progress.style.setProperty('--progress', `${Number(progress.value) / 10}%`);
+    if (player.duration) player.currentTime = Number(progress.value) / 1000 * player.duration;
+  });
+  progress.addEventListener('pointerdown', () => timeline.classList.add('scrubbing'));
+  for (const name of ['pointerup', 'pointercancel']) progress.addEventListener(name, () => timeline.classList.remove('scrubbing'));
   timeline.append(progress, clock);
-  card.append(player, seek, meta, rail, timeline);
+  playerActions.set(player, { togglePlay, seekBy, fullscreen: () => fullscreen.click(), like: () => setLike(!video.liked).catch(() => {}) });
+  card.append(player, buffer, badge, seek, meta, rail, timeline);
   return card;
+}
+
+// Reported once per feed session so the FYP ranking can push watched videos down later.
+function reportView(video) {
+  if (reportedViews.has(video.id)) return;
+  reportedViews.add(video.id);
+  fetch(`/api/videos/${video.id}/view`, { method: 'POST', keepalive: true }).catch(() => reportedViews.delete(video.id));
+}
+
+function playActiveCard() {
+  const player = activePlayer; if (!player || !state.feedReady) return;
+  ensureFeedStream(player); playPlayer(player);
 }
 
 function observePlayback() {
   playbackObserver?.disconnect(); bufferObserver?.disconnect();
   playbackObserver = new IntersectionObserver(entries => entries.forEach(entry => {
+    // Kartu yang naik ke layar penuh keluar dari scrollport feed; abaikan supaya
+    // videonya tidak ikut dijeda dan streamnya tidak dilepas.
+    if (document.fullscreenElement) return;
     const video = entry.target.querySelector('video');
-    if (entry.isIntersecting && entry.intersectionRatio > .75) { ensureFeedStream(video); video.play().catch(() => {}); } else video.pause();
-    if (entry.isIntersecting && entry.intersectionRatio > .25) {
-      const index = state.videos.findIndex(item => item.id === Number(entry.target.dataset.videoId));
-      if (index >= state.videos.length - 2) loadMoreVideos().catch(() => {});
-    }
+    if (entry.isIntersecting && entry.intersectionRatio > .75) { activePlayer = video; ensureFeedStream(video); if (state.feedReady) playPlayer(video); } else video.pause();
+    if (entry.isIntersecting && entry.intersectionRatio > .25 && Number(entry.target.dataset.feedIndex) >= state.videos.length - 2) loadMoreVideos().catch(() => {});
   }), { root: $('#feed'), threshold: [.25, .75] });
   bufferObserver = new IntersectionObserver(entries => entries.forEach(entry => {
+    if (document.fullscreenElement) return;
     const player = entry.target.querySelector('video');
     if (entry.isIntersecting) ensureFeedStream(player); else releaseFeedStream(player);
   }), { root: $('#feed'), rootMargin: '50% 0px 75% 0px', threshold: 0 });
@@ -156,20 +345,34 @@ function observePlayback() {
 
 async function loadVideos(reset = false) {
   if (state.viewerLoading && !reset) return;
-  if (!reset && state.viewerPagination && state.viewerPage >= state.viewerPagination.totalPages) return;
+  if (!reset && state.feedEnded) return;
+  // Feed tidak pernah mentok: sampai di halaman terakhir, kocok ulang dengan seed baru.
+  const relap = !reset && Boolean(state.viewerPagination) && state.viewerPage >= state.viewerPagination.totalPages;
+  if (relap) { state.viewerSeed = shuffleSeed(); state.viewerSince = Date.now(); reportedViews.clear(); }
   const loadId = reset ? ++state.viewerLoadId : state.viewerLoadId;
-  const page = reset ? 1 : state.viewerPage + 1;
-  const query = new URLSearchParams({ page, limit: 5 });
+  const page = reset || relap ? 1 : state.viewerPage + 1;
+  const query = new URLSearchParams({ page, limit: 5, age: Math.max(0, Date.now() - (state.viewerSince || Date.now())) });
   if (state.viewerCategory) query.set('category', state.viewerCategory);
   if (state.viewerQuery) query.set('q', state.viewerQuery);
   if (state.viewerSeed) query.set('seed', state.viewerSeed);
   state.viewerLoading = true;
   try {
-    const { videos, pagination } = await api(`/api/videos?${query}`);
+    const [{ videos, pagination }, startVideo] = await Promise.all([
+      api(`/api/videos?${query}`),
+      reset && state.viewerStartId ? api(`/api/videos/${state.viewerStartId}`).then(body => body.video).catch(() => null) : null
+    ]);
     if (loadId !== state.viewerLoadId) return;
     state.viewerPage = pagination.page; state.viewerPagination = pagination;
-    if (reset) { state.videos = videos; renderFeed(videos); }
-    else { state.videos.push(...videos); renderFeed(videos, true); }
+    if (reset) {
+      const opening = startVideo ? [startVideo, ...videos.filter(item => item.id !== startVideo.id)] : videos;
+      state.lapStart = 0; state.feedEnded = false; state.videos = opening; renderFeed(opening);
+    } else {
+      if (relap) state.lapStart = state.videos.length;
+      const known = new Set(state.videos.slice(state.lapStart).map(item => item.id));
+      const fresh = videos.filter(item => !known.has(item.id));
+      if (relap && !fresh.length) state.feedEnded = true;
+      state.videos.push(...fresh); renderFeed(fresh, true);
+    }
   } finally {
     if (loadId === state.viewerLoadId) state.viewerLoading = false;
   }
@@ -178,48 +381,156 @@ async function loadVideos(reset = false) {
 function loadMoreVideos() { return loadVideos(false); }
 
 function renderFeed(videos, append = false) {
-  const cards = videos.map(video => { const card = makeCard(video); card.dataset.videoId = video.id; return card; });
+  const offset = append ? state.videos.length - videos.length : 0;
+  const cards = videos.map((video, index) => { const card = makeCard(video); card.dataset.feedIndex = offset + index; return card; });
   if (append) $('#feed').append(...cards); else { releaseFeed(); $('#feed').replaceChildren(...cards); $('#feed').scrollTop = 0; }
   $('#empty').textContent = state.viewerCategory ? 'Belum ada video di kategori ini.' : 'Belum ada video.';
   $('#empty').hidden = state.videos.length > 0; observePlayback();
 }
 
-async function showWatch(category = '', query = '') {
-  $('#search-view').hidden = true; $('#feed').hidden = false; $('#tab-watch').classList.add('active'); $('#tab-search').classList.remove('active');
-  state.viewerCategory = category; state.viewerQuery = query; state.viewerSeed = query ? 0 : shuffleSeed(); await loadVideos(true);
+async function showWatch({ category = '', query = '', seed = 0, startId = 0, keepFeed = false } = {}) {
+  showViewerSection('watch');
+  showIntro();
+  if (keepFeed && state.videos.length) { observePlayback(); return; }
+  state.viewerCategory = category; state.viewerQuery = query; state.viewerSeed = seed; state.viewerStartId = startId;
+  state.viewerSince = Date.now(); reportedViews.clear();
+  await loadVideos(true);
+}
+
+const introDelay = 1900;
+function readStore(key) { try { return localStorage.getItem(key); } catch { return null; } }
+function writeStore(key, value) { try { localStorage.setItem(key, value); } catch { /* penyimpanan tidak tersedia */ } }
+function readFlag(key) { return readStore(key) === '1'; }
+function writeFlag(key) { writeStore(key, '1'); }
+
+// Layar instruksi menahan pemutaran sampai penonton siap — bukan langsung menyalak.
+function showIntro() {
+  const overlay = $('#feed-intro');
+  clearTimeout(state.feedIntroTimer);
+  state.feedReady = false;
+  const seen = readFlag('lv-intro-seen');
+  $('#feed-intro-hint').hidden = !seen;
+  overlay.classList.remove('visible', 'counting');
+  overlay.style.setProperty('--intro-delay', `${introDelay}ms`);
+  overlay.hidden = false;
+  requestAnimationFrame(() => {
+    if (overlay.hidden) return;
+    overlay.classList.add('visible');
+    if (!seen) return;
+    requestAnimationFrame(() => overlay.classList.add('counting'));
+    state.feedIntroTimer = setTimeout(dismissIntro, introDelay);
+  });
+}
+
+function dismissIntro() {
+  const overlay = $('#feed-intro');
+  clearTimeout(state.feedIntroTimer);
+  if (overlay.hidden || state.feedReady) return;
+  writeFlag('lv-intro-seen');
+  overlay.classList.remove('visible', 'counting');
+  setTimeout(() => { if (!overlay.classList.contains('visible')) overlay.hidden = true; }, 320);
+  state.feedReady = true;
+  playActiveCard();
+}
+
+function hideIntro() {
+  clearTimeout(state.feedIntroTimer);
+  const overlay = $('#feed-intro');
+  overlay.classList.remove('visible', 'counting'); overlay.hidden = true;
+  state.feedReady = false;
+}
+
+function setPull(progress) {
+  const indicator = $('#feed-refresh');
+  const value = Math.max(0, Math.min(1, progress));
+  indicator.style.setProperty('--pull', value.toFixed(3));
+  indicator.classList.toggle('armed', value >= 1);
+  return value;
 }
 
 let reshuffling = false;
 async function reshuffleWatch() {
-  if (reshuffling || $('#feed').hidden || $('#feed').scrollTop > 1) return;
-  reshuffling = true; $('#feed').classList.add('reshuffling'); state.viewerSeed = shuffleSeed();
-  try { await loadVideos(true); } finally { $('#feed').classList.remove('reshuffling'); reshuffling = false; }
+  if (reshuffling || $('#feed').hidden) return;
+  reshuffling = true;
+  const indicator = $('#feed-refresh'); const startedAt = Date.now();
+  indicator.classList.add('spinning'); $('#feed').classList.add('reshuffling');
+  state.viewerSeed = shuffleSeed(); state.viewerStartId = 0; state.viewerSince = Date.now(); reportedViews.clear();
+  const params = new URLSearchParams(location.search);
+  params.set('seed', String(state.viewerSeed)); params.delete('v');
+  const target = `/watch?${params}`;
+  history.replaceState(null, '', target); state.route = target;
+  try { await loadVideos(true); }
+  catch (error) { $('#empty').textContent = error.message; $('#empty').hidden = false; }
+  finally {
+    setTimeout(() => {
+      indicator.classList.remove('spinning'); setPull(0);
+      $('#feed').classList.remove('reshuffling'); reshuffling = false;
+    }, Math.max(0, 520 - (Date.now() - startedAt)));
+  }
 }
 
-function categoryCard(category) {
-  const card = document.createElement('button'); card.type = 'button'; card.className = 'category-card';
+function cardFallback() {
+  const fallback = document.createElement('span'); fallback.className = 'card-fallback brand'; fallback.textContent = 'LV'; return fallback;
+}
+
+function categoryCard(category, index = 0) {
+  const card = document.createElement('button'); card.type = 'button'; card.className = 'category-card'; card.style.setProperty('--i', index);
   if (category.thumbnail) { const image = document.createElement('img'); image.src = category.thumbnail; image.alt = ''; card.append(image); }
+  else card.append(cardFallback());
   const overlay = document.createElement('span'); overlay.className = 'category-overlay';
   const name = document.createElement('strong'); name.textContent = category.name;
   const count = document.createElement('small'); count.textContent = `${category.videoCount} video`;
-  overlay.append(name, count); card.append(overlay); card.addEventListener('click', () => showWatch(category.name)); return card;
+  overlay.append(name, count); card.append(overlay); card.addEventListener('click', () => navigate('/watch', { category: category.name })); return card;
 }
 
-function searchVideoCard(video) {
-  const card = document.createElement('button'); card.type = 'button'; card.className = 'category-card search-video-card';
+function homeVideoCard(video, index = 0) {
+  const card = document.createElement('button'); card.type = 'button'; card.className = 'home-video-card'; card.style.setProperty('--i', index);
+  const visual = document.createElement('span'); visual.className = 'home-video-visual';
+  if (video.thumbnail) {
+    const image = document.createElement('img'); image.src = video.thumbnail; image.alt = ''; visual.append(image);
+  } else {
+    const fallback = document.createElement('span'); fallback.className = 'brand'; fallback.textContent = 'LV'; visual.append(fallback);
+  }
+  const details = document.createElement('span'); details.className = 'home-video-details';
+  const title = document.createElement('strong'); title.textContent = video.title;
+  const meta = document.createElement('small'); meta.textContent = `${(video.categories || [video.category]).join(' · ')} · ${formatTime(video.durationSeconds)}`;
+  details.append(title, meta); card.append(visual, details); card.addEventListener('click', () => navigate('/watch', { v: video.id })); return card;
+}
+
+async function loadHomeVideos() {
+  const loadId = ++state.homeLoadId; const empty = $('#home-video-empty');
+  empty.textContent = 'Memuat koleksi…'; empty.hidden = false;
+  try {
+    const { videos, pagination } = await api('/api/videos?page=1&limit=6');
+    if (loadId !== state.homeLoadId) return;
+    state.homeVideos = videos; state.homePagination = pagination;
+    $('#home-video-grid').replaceChildren(...videos.map(homeVideoCard));
+    empty.textContent = 'Belum ada video di koleksi.';
+    empty.hidden = videos.length > 0;
+  } catch (error) {
+    if (loadId !== state.homeLoadId) return;
+    state.homeVideos = []; state.homePagination = null; $('#home-video-grid').replaceChildren();
+    empty.textContent = error.message; empty.hidden = false;
+  }
+}
+
+function searchVideoCard(video, index = 0) {
+  const card = document.createElement('button'); card.type = 'button'; card.className = 'category-card search-video-card'; card.style.setProperty('--i', index);
   if (video.thumbnail) { const image = document.createElement('img'); image.src = video.thumbnail; image.alt = ''; card.append(image); }
+  else card.append(cardFallback());
   const overlay = document.createElement('span'); overlay.className = 'category-overlay';
   const title = document.createElement('strong'); title.textContent = video.title;
   const category = document.createElement('small'); category.textContent = (video.categories || [video.category]).join(' · ');
-  overlay.append(title, category); card.append(overlay); card.addEventListener('click', () => openSearchResult(video)); return card;
+  overlay.append(title, category); card.append(overlay); card.addEventListener('click', () => navigate('/watch', { v: video.id, q: state.searchQuery })); return card;
 }
 
-async function showSearch() {
-  releaseFeed();
-  $('#feed').hidden = true; $('#search-view').hidden = false; $('#empty').hidden = true; $('#tab-watch').classList.remove('active'); $('#tab-search').classList.add('active');
-  state.searchQuery = $('#viewer-search').value.trim();
-  if (state.searchQuery) await loadSearchVideos(true); else await loadSearchCategories();
-  requestAnimationFrame(() => $('#viewer-search').focus({ preventScroll: true }));
+async function showSearch(query = '') {
+  releaseFeed(); hideIntro();
+  showViewerSection('search');
+  if ($('#viewer-search').value !== query) $('#viewer-search').value = query;
+  state.searchQuery = query;
+  if (query) await loadSearchVideos(true); else await loadSearchCategories();
+  if (document.activeElement !== $('#viewer-search')) requestAnimationFrame(() => $('#viewer-search').focus({ preventScroll: true }));
 }
 
 async function loadSearchCategories() {
@@ -247,10 +558,8 @@ async function loadSearchVideos(reset = false) {
   } finally { if (loadId === state.searchLoadId) state.searchLoading = false; }
 }
 
-function openSearchResult(video) {
-  state.viewerCategory = ''; state.viewerQuery = state.searchQuery; state.viewerSeed = 0; state.viewerPage = state.searchPage; state.viewerPagination = state.searchPagination; state.videos = [...state.searchVideos];
-  $('#search-view').hidden = true; $('#feed').hidden = false; $('#tab-search').classList.remove('active'); $('#tab-watch').classList.add('active'); renderFeed(state.videos);
-  requestAnimationFrame(() => { const card = document.querySelector(`#feed [data-video-id="${video.id}"]`); if (card) $('#feed').scrollTop = card.offsetTop; });
+function showProfile() {
+  releaseFeed(); hideIntro(); showViewerSection('profile');
 }
 
 async function loadAdminVideos() {
@@ -333,31 +642,82 @@ function renderAdminList() {
 
 $('#login-form').addEventListener('submit', async event => {
   event.preventDefault(); $('#login-error').textContent = '';
+  const submit = event.target.querySelector('button'); submit.disabled = true;
   try {
     const { user } = await api('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: $('#username').value, password: $('#password').value }) });
-    $('#password').value = ''; await enterApp(user);
+    $('#password').value = ''; state.user = user; await navigate(landingPath(), {}, { replace: true });
   } catch (error) { $('#login-error').textContent = error.message; }
+  finally { submit.disabled = false; }
 });
 
-async function logout() { await api('/api/logout', { method: 'POST' }); showLogin(); }
-$('#logout').addEventListener('click', logout); $('#admin-logout').addEventListener('click', logout);
-$('#viewer-home').addEventListener('click', showHome); $('#admin-home').addEventListener('click', showHome);
-$('#home-enter').addEventListener('click', () => enterApp(state.user)); $('#home-primary').addEventListener('click', () => enterApp(state.user));
-$('#tab-watch').addEventListener('click', () => showWatch());
-$('#tab-search').addEventListener('click', () => showSearch().catch(error => { $('#viewer-search-empty').textContent = error.message; $('#viewer-search-empty').hidden = false; }));
-$('#viewer-search-form').addEventListener('submit', event => { event.preventDefault(); clearTimeout(state.searchTimer); state.searchQuery = $('#viewer-search').value.trim(); (state.searchQuery ? loadSearchVideos(true) : loadSearchCategories()).catch(error => { $('#viewer-search-empty').textContent = error.message; $('#viewer-search-empty').hidden = false; }); });
+async function logout() { await api('/api/logout', { method: 'POST' }); state.user = null; reportedViews.clear(); await navigate('/login', {}, { replace: true }); }
+const routeError = error => { $('#viewer-search-empty').textContent = error.message; $('#viewer-search-empty').hidden = false; };
+$('#profile-logout').addEventListener('click', logout); $('#admin-logout').addEventListener('click', logout);
+$('#admin-home').addEventListener('click', () => navigate('/'));
+$('#home-enter').addEventListener('click', () => navigate(landingPath())); $('#home-primary').addEventListener('click', () => navigate(landingPath()));
+$('#tab-home').addEventListener('click', () => navigate('/home'));
+$('#home-watch').addEventListener('click', () => navigate('/watch'));
+$('#home-see-all').addEventListener('click', () => navigate('/watch'));
+$('#tab-watch').addEventListener('click', () => navigate('/watch'));
+$('#tab-search').addEventListener('click', () => navigate('/search', { q: state.searchQuery }).catch(routeError));
+$('#tab-profile').addEventListener('click', () => navigate('/profile'));
+$('#viewer-search-form').addEventListener('submit', event => {
+  event.preventDefault(); clearTimeout(state.searchTimer);
+  navigate('/search', { q: $('#viewer-search').value.trim() }, { replace: true }).catch(routeError);
+});
 $('#viewer-search').addEventListener('input', () => {
-  clearTimeout(state.searchTimer); state.searchTimer = setTimeout(() => {
-    state.searchQuery = $('#viewer-search').value.trim();
-    (state.searchQuery ? loadSearchVideos(true) : loadSearchCategories()).catch(error => { $('#viewer-search-empty').textContent = error.message; $('#viewer-search-empty').hidden = false; });
-  }, 260);
+  clearTimeout(state.searchTimer);
+  state.searchTimer = setTimeout(() => navigate('/search', { q: $('#viewer-search').value.trim() }, { replace: true }).catch(routeError), 260);
 });
 $('#search-view').addEventListener('scroll', () => { if (state.searchQuery && $('#search-view').scrollTop + $('#search-view').clientHeight >= $('#search-view').scrollHeight - 320) loadSearchVideos().catch(() => {}); });
-$('#feed').addEventListener('wheel', event => { if ($('#feed').scrollTop <= 1 && event.deltaY < -45) reshuffleWatch().catch(() => {}); }, { passive: true });
-let feedTouchStart = null; let feedTouchPull = 0;
-$('#feed').addEventListener('touchstart', event => { feedTouchStart = $('#feed').scrollTop <= 1 ? event.touches[0]?.clientY ?? null : null; feedTouchPull = 0; }, { passive: true });
-$('#feed').addEventListener('touchmove', event => { if (feedTouchStart !== null) feedTouchPull = Math.max(0, (event.touches[0]?.clientY ?? feedTouchStart) - feedTouchStart); }, { passive: true });
-$('#feed').addEventListener('touchend', () => { if (feedTouchPull > 72) reshuffleWatch().catch(() => {}); feedTouchStart = null; feedTouchPull = 0; }, { passive: true });
+$('#feed-intro').addEventListener('click', dismissIntro);
+$('#feed-intro').addEventListener('wheel', dismissIntro, { passive: true });
+$('#feed-intro').addEventListener('touchstart', dismissIntro, { passive: true });
+document.addEventListener('keydown', event => {
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (!$('#feed-intro').hidden) { dismissIntro(); return; }
+  if ($('#feed').hidden || !state.feedReady) return;
+  if (event.target?.closest?.('input, textarea, select, dialog')) return;
+  const actions = playerActions.get(activePlayer);
+  const keys = {
+    ' ': () => actions?.togglePlay(), k: () => actions?.togglePlay(),
+    ArrowLeft: () => actions?.seekBy(-10), ArrowRight: () => actions?.seekBy(10),
+    ArrowUp: () => $('#feed').scrollBy({ top: -$('#feed').clientHeight, behavior: 'smooth' }),
+    ArrowDown: () => $('#feed').scrollBy({ top: $('#feed').clientHeight, behavior: 'smooth' }),
+    m: () => setMuted(!state.muted), f: () => actions?.fullscreen(), l: () => actions?.like()
+  };
+  const action = keys[event.key.length === 1 ? event.key.toLowerCase() : event.key];
+  if (action) { event.preventDefault(); action(); }
+});
+
+const pullThreshold = 92;
+const wheelThreshold = 190;
+let feedTouchStart = null; let feedTouchPull = 0; let wheelPull = 0; let wheelTimer = null;
+$('#feed').addEventListener('wheel', event => {
+  const feed = $('#feed');
+  if (reshuffling || feed.scrollTop > 1 || event.deltaY >= 0) { if (wheelPull) { wheelPull = 0; setPull(0); } return; }
+  wheelPull += -event.deltaY;
+  clearTimeout(wheelTimer); wheelTimer = setTimeout(() => { wheelPull = 0; setPull(0); }, 300);
+  if (wheelPull >= wheelThreshold) { wheelPull = 0; clearTimeout(wheelTimer); reshuffleWatch().catch(() => {}); return; }
+  setPull(wheelPull / wheelThreshold);
+}, { passive: true });
+$('#feed').addEventListener('touchstart', event => {
+  feedTouchStart = !reshuffling && $('#feed').scrollTop <= 1 && event.touches.length === 1 ? event.touches[0].clientY : null;
+  feedTouchPull = 0;
+}, { passive: true });
+$('#feed').addEventListener('touchmove', event => {
+  if (feedTouchStart === null) return;
+  if ($('#feed').scrollTop > 1) { feedTouchStart = null; feedTouchPull = 0; setPull(0); return; }
+  const distance = (event.touches[0]?.clientY ?? feedTouchStart) - feedTouchStart;
+  if (distance <= 0) { if (feedTouchPull) { feedTouchPull = 0; setPull(0); } return; }
+  feedTouchPull = distance;
+  if (event.cancelable) event.preventDefault();
+  setPull(distance / pullThreshold);
+}, { passive: false });
+for (const eventName of ['touchend', 'touchcancel']) $('#feed').addEventListener(eventName, () => {
+  if (feedTouchPull >= pullThreshold) reshuffleWatch().catch(() => {}); else setPull(0);
+  feedTouchStart = null; feedTouchPull = 0;
+}, { passive: true });
 $('#preview-dialog').addEventListener('close', () => { const player = $('#preview-video'); streams.get(player)?.destroy(); player.pause(); player.removeAttribute('src'); player.load(); });
 $('#metadata-dialog').addEventListener('close', () => { const player = $('#frame-video'); streams.get(player)?.destroy(); player.pause(); player.removeAttribute('src'); player.load(); });
 function selectAddTab(tab) {
@@ -386,6 +746,13 @@ $('#admin-search').addEventListener('input', () => { clearTimeout(state.adminSea
 for (const selector of ['#admin-category', '#admin-status-filter', '#admin-sort']) $(selector).addEventListener('change', applyAdminTools);
 $('#page-prev').addEventListener('click', async () => { if (state.page > 1) { state.page -= 1; await loadAdminVideos(); } });
 $('#page-next').addEventListener('click', async () => { if (state.pagination && state.page < state.pagination.totalPages) { state.page += 1; await loadAdminVideos(); } });
+$('#feed-mode').addEventListener('change', async () => {
+  const status = $('#admin-status');
+  try {
+    const { feedMode } = await api('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ feedMode: $('#feed-mode').value }) });
+    status.textContent = feedMode === 'fyp' ? 'Feed pengguna: FYP (belum ditonton dulu, disukai naik).' : 'Feed pengguna: acak murni.';
+  } catch (error) { status.textContent = error.message; }
+});
 $('#sync-videos').addEventListener('click', async () => {
   const status = $('#admin-status');
   try {
@@ -458,4 +825,8 @@ $('#manage-delete').addEventListener('click', async () => {
   catch (error) { $('#metadata-status').textContent = error.message; }
 });
 
-api('/api/me').then(({ user }) => user ? enterApp(user) : showLogin()).catch(showLogin);
+window.addEventListener('popstate', () => applyRoute());
+api('/api/me')
+  .then(({ user }) => { state.user = user || null; })
+  .catch(() => { state.user = null; })
+  .finally(() => applyRoute());

@@ -26,6 +26,7 @@ db.prepare("UPDATE videos SET conversion_status='failed', conversion_error='Pros
 db.prepare("UPDATE videos SET ingest_status='failed', ingest_error='Download terhenti saat layanan dimulai ulang.' WHERE ingest_status='downloading'").run();
 
 const mime = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.jpg': 'image/jpeg', '.m3u8': 'application/vnd.apple.mpegurl', '.ts': 'video/mp2t' };
+const appRoutes = new Set(['/', '/login', '/home', '/watch', '/search', '/profile', '/admin']);
 const metadataJobs = new Set();
 const conversionJobs = new Map();
 const remoteJobs = new Map();
@@ -57,6 +58,35 @@ function setVideoCategories(videoId, value) {
   return names;
 }
 
+const feedModes = ['fyp', 'shuffle'];
+function feedMode() {
+  const row = db.prepare("SELECT value FROM settings WHERE key='feed_mode'").get();
+  return feedModes.includes(row?.value) ? row.value : 'fyp';
+}
+
+const feedPrime = 2147483647;
+const feedPrimeAlt = 2147483629;
+const feedRecentWindow = 3 * 86400000;
+const feedAffinityBoost = Math.round(feedPrime * 0.35);
+function mixSeed(value) {
+  let mixed = (value >>> 0) || 0x9e3779b9;
+  mixed = Math.imul(mixed ^ (mixed >>> 16), 2246822507) >>> 0;
+  mixed = Math.imul(mixed ^ (mixed >>> 13), 3266489909) >>> 0;
+  return (mixed ^ (mixed >>> 16)) >>> 0;
+}
+// Hashes each id into a per-seed pseudo-random key, so ordering by it is a real shuffle
+// that is still stable for the whole seed — which is what keeps paging consistent.
+// Two rounds over different primes with an xor-shift between them; SQLite has no xor
+// operator, so it is spelled out as (a|b)-(a&b).
+function shuffleKey(seed) {
+  const multiplier = mixSeed(seed) % (feedPrime - 1) + 1;
+  const finalizer = mixSeed(seed ^ 0x9e3779b9) % (feedPrimeAlt - 1) + 1;
+  const rotation = mixSeed(seed ^ 0x5bf03635) % 1048573;
+  const round = `(((videos.id + ${rotation}) * ${multiplier}) % ${feedPrime})`;
+  const scrambled = `((${round} | (${round} >> 12)) - (${round} & (${round} >> 12)))`;
+  return `((${scrambled} * ${finalizer}) % ${feedPrimeAlt})`;
+}
+
 function securityHeaders(extra = {}) {
   return { 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'X-Robots-Tag': 'noindex, nofollow, noarchive', 'Referrer-Policy': 'no-referrer', 'Cache-Control': 'no-store', ...extra };
 }
@@ -66,6 +96,11 @@ function json(res, status, body, extra) {
 }
 function parseCookies(req) {
   return Object.fromEntries((req.headers.cookie || '').split(';').map(v => v.trim().split('=').map(decodeURIComponent)).filter(v => v.length === 2));
+}
+function sessionCookie(req, token, maxAge) {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  const secure = req.socket.encrypted || forwardedProto === 'https' ? '; Secure' : '';
+  return 'lv_session=' + encodeURIComponent(token) + '; Path=/; HttpOnly' + secure + '; SameSite=Strict; Max-Age=' + maxAge;
 }
 function currentUser(req) {
   const token = parseCookies(req).lv_session;
@@ -414,7 +449,7 @@ async function route(req, res) {
     if (req.method === 'HEAD') return res.end();
     return res.end('User-agent: *\nDisallow: /\n');
   }
-  if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/') return serveStatic(req, res, 'index.html');
+  if ((req.method === 'GET' || req.method === 'HEAD') && appRoutes.has(url.pathname)) return serveStatic(req, res, 'index.html');
   if ((req.method === 'GET' || req.method === 'HEAD') && ['/app.css', '/app.js'].includes(url.pathname)) return serveStatic(req, res, url.pathname.slice(1));
   if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/vendor/hls.min.js') {
     return servePrivateFile(req, res, path.join(appRoot, 'node_modules', 'hls.js', 'dist', 'hls.min.js'), 'application/javascript; charset=utf-8', 'private, max-age=86400');
@@ -427,11 +462,21 @@ async function route(req, res) {
     const token = crypto.randomBytes(32).toString('base64url'); const expires = Date.now() + 7 * 86400000;
     db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(Date.now());
     db.prepare('INSERT INTO sessions (token_hash,user_id,expires_at) VALUES (?,?,?)').run(tokenHash(token), user.id, expires);
-    return json(res, 200, { user: { id: user.id, username: user.username, role: user.role } }, { 'Set-Cookie': `lv_session=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=604800` });
+    return json(res, 200, { user: { id: user.id, username: user.username, role: user.role } }, { 'Set-Cookie': sessionCookie(req, token, 604800) });
   }
   if (req.method === 'POST' && url.pathname === '/api/logout') {
     const token = parseCookies(req).lv_session; if (token) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(tokenHash(token));
-    return json(res, 200, { ok: true }, { 'Set-Cookie': 'lv_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0' });
+    return json(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', 0) });
+  }
+  if (url.pathname === '/api/settings') {
+    if (!requireUser(req, res, 'admin')) return;
+    if (req.method === 'GET') return json(res, 200, { feedMode: feedMode() });
+    if (req.method === 'PATCH') {
+      const body = await readJson(req);
+      if (!feedModes.includes(body.feedMode)) return json(res, 400, { error: 'Mode feed tidak dikenal.' });
+      db.prepare("INSERT INTO settings (key,value) VALUES ('feed_mode',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(body.feedMode);
+      return json(res, 200, { feedMode: body.feedMode });
+    }
   }
   if (req.method === 'GET' && url.pathname === '/api/categories') {
     if (!requireUser(req, res)) return;
@@ -441,16 +486,16 @@ async function route(req, res) {
         WHERE sample_video_categories.category_id=categories.id
           AND sample_videos.ingest_status='ready' AND sample_videos.conversion_status!='converting'
           AND sample_videos.thumbnail IS NOT NULL
-        ORDER BY random() LIMIT 1) AS thumbnail_id
+        ORDER BY sample_videos.sort_order DESC, sample_videos.id DESC LIMIT 1) AS thumbnail_id
       FROM categories
       JOIN video_categories ON video_categories.category_id=categories.id
       JOIN videos ON videos.id=video_categories.video_id
       WHERE videos.ingest_status='ready' AND videos.conversion_status!='converting'
       GROUP BY categories.id, categories.name
-      ORDER BY random() LIMIT 10`).all().map(category => ({
+      ORDER BY video_count DESC, categories.name COLLATE NOCASE LIMIT 12`).all().map(category => ({
         name: category.name,
         videoCount: Number(category.video_count),
-        thumbnail: category.thumbnail_id ? `/thumbnail/${category.thumbnail_id}?browse=${Date.now()}` : null
+        thumbnail: category.thumbnail_id ? `/thumbnail/${category.thumbnail_id}` : null
       }));
     return json(res, 200, { categories });
   }
@@ -499,18 +544,37 @@ async function route(req, res) {
       };
       const requestedSort = url.searchParams.get('sort') || '';
       const requestedSeed = Number.parseInt(url.searchParams.get('seed') || '', 10);
-      const shuffleSeed = Number.isFinite(requestedSeed) && requestedSeed > 0 ? Math.min(1000000, requestedSeed) : 0;
-      const shuffleFactor = shuffleSeed * 2 + 1;
-      const shuffleOffset = shuffleSeed * 48271 % 2147483647;
+      const shuffleSeed = Number.isFinite(requestedSeed) && requestedSeed > 0 ? requestedSeed % feedPrime : 0;
+      const shuffled = user.role !== 'admin' && shuffleSeed > 0;
+      const personalized = shuffled && feedMode() === 'fyp';
+      // Views recorded after the feed session started are ignored so paging stays stable
+      // while the user keeps scrolling through the same shuffle. The client sends the age
+      // of its session rather than a timestamp, so a skewed browser clock cannot shift it.
+      const requestedAge = Number.parseInt(url.searchParams.get('age') || '', 10);
+      const since = Date.now() - (Number.isFinite(requestedAge) ? Math.min(86400000, Math.max(0, requestedAge)) : 0);
+      const from = personalized
+        ? `videos LEFT JOIN (SELECT video_id, MAX(viewed_at) AS viewed_at FROM video_views
+            WHERE user_id=${user.id} AND viewed_at<${since} GROUP BY video_id) feed_views ON feed_views.video_id=videos.id`
+        : 'videos';
+      // Unseen first, then long-unwatched, then just-watched; inside each tier the shuffle
+      // decides, nudged by videos sharing a category with something the user has loved.
+      const feedOrder = `(CASE WHEN feed_views.viewed_at IS NULL THEN 0
+          WHEN feed_views.viewed_at < ${since - feedRecentWindow} THEN 1 ELSE 2 END) ASC,
+        (${shuffleKey(shuffleSeed)} - (CASE WHEN EXISTS (
+          SELECT 1 FROM video_categories affinity_categories
+          JOIN video_categories liked_categories ON liked_categories.category_id=affinity_categories.category_id
+          JOIN video_likes affinity_likes ON affinity_likes.video_id=liked_categories.video_id AND affinity_likes.user_id=${user.id}
+          WHERE affinity_categories.video_id=videos.id) THEN ${feedAffinityBoost} ELSE 0 END)) ASC,
+        videos.id DESC`;
       const order = user.role === 'admin' && Object.hasOwn(sortOrders, requestedSort)
         ? sortOrders[requestedSort]
-        : user.role !== 'admin' && shuffleSeed
-          ? `((videos.id * ${shuffleFactor} + ${shuffleOffset}) & 2147483647) ASC, videos.id DESC`
-          : sortOrders.newest;
+        : personalized ? feedOrder
+          : shuffled ? `${shuffleKey(shuffleSeed)} ASC, videos.id DESC`
+            : sortOrders.newest;
       const select = `SELECT videos.*,
         EXISTS(SELECT 1 FROM video_likes WHERE video_likes.user_id=? AND video_likes.video_id=videos.id) AS liked,
         (SELECT COUNT(*) FROM video_likes WHERE video_likes.video_id=videos.id) AS like_count
-        FROM videos ${where} ORDER BY ${order}`;
+        FROM ${from} ${where} ORDER BY ${order}`;
       const total = db.prepare(`SELECT COUNT(*) AS total FROM videos ${where}`).get(...parameters).total;
       const totalPages = Math.max(1, Math.ceil(total / limit));
       const page = Math.min(requestedPage, totalPages);
@@ -548,6 +612,16 @@ async function route(req, res) {
     return json(res, 202, cleanVideo(row));
   }
   const editMatch = /^\/api\/videos\/(\d+)$/.exec(url.pathname);
+  if (req.method === 'GET' && editMatch) {
+    const user = requireUser(req, res); if (!user) return;
+    const visibility = user.role === 'admin' ? '' : " AND conversion_status!='converting' AND ingest_status='ready'";
+    const row = db.prepare(`SELECT videos.*,
+      EXISTS(SELECT 1 FROM video_likes WHERE video_likes.user_id=? AND video_likes.video_id=videos.id) AS liked,
+      (SELECT COUNT(*) FROM video_likes WHERE video_likes.video_id=videos.id) AS like_count
+      FROM videos WHERE id=?${visibility}`).get(user.id, editMatch[1]);
+    if (!row) return json(res, 404, { error: 'Video tidak ditemukan.' });
+    return json(res, 200, { video: cleanVideo(row) });
+  }
   if (req.method === 'PATCH' && editMatch) {
     if (!requireUser(req, res, 'admin')) return;
     const row = db.prepare('SELECT id FROM videos WHERE id=?').get(editMatch[1]);
@@ -587,6 +661,14 @@ async function route(req, res) {
     if (row.conversion_status !== 'converted' || !row.hls_manifest) return json(res, 409, { error: 'Konversi HLS belum selesai.' });
     fs.rmSync(path.join(uploadDir, path.basename(row.source)), { force: true });
     db.prepare('UPDATE videos SET original_deleted=1 WHERE id=?').run(row.id);
+    return json(res, 200, { ok: true });
+  }
+  const viewMatch = /^\/api\/videos\/(\d+)\/view$/.exec(url.pathname);
+  if (req.method === 'POST' && viewMatch) {
+    const user = requireUser(req, res); if (!user) return;
+    if (!db.prepare('SELECT 1 FROM videos WHERE id=?').get(viewMatch[1])) return json(res, 404, { error: 'Video tidak ditemukan.' });
+    db.prepare(`INSERT INTO video_views (user_id,video_id,viewed_at,view_count) VALUES (?,?,?,1)
+      ON CONFLICT(user_id,video_id) DO UPDATE SET viewed_at=excluded.viewed_at, view_count=view_count+1`).run(user.id, Number(viewMatch[1]), Date.now());
     return json(res, 200, { ok: true });
   }
   const likeMatch = /^\/api\/videos\/(\d+)\/like$/.exec(url.pathname);
