@@ -49,7 +49,13 @@ const migrations = [
   ['thumbnail_version', 'ALTER TABLE videos ADD COLUMN thumbnail_version INTEGER NOT NULL DEFAULT 1'],
   ['ingest_status', "ALTER TABLE videos ADD COLUMN ingest_status TEXT NOT NULL DEFAULT 'ready'"],
   ['ingest_error', 'ALTER TABLE videos ADD COLUMN ingest_error TEXT'],
-  ['source_url', 'ALTER TABLE videos ADD COLUMN source_url TEXT']
+  ['source_url', 'ALTER TABLE videos ADD COLUMN source_url TEXT'],
+  ['media_type', "ALTER TABLE videos ADD COLUMN media_type TEXT NOT NULL DEFAULT 'video'"],
+  ['optimization_status', "ALTER TABLE videos ADD COLUMN optimization_status TEXT NOT NULL DEFAULT 'none'"],
+  ['optimization_error', 'ALTER TABLE videos ADD COLUMN optimization_error TEXT'],
+  ['original_size_bytes', 'ALTER TABLE videos ADD COLUMN original_size_bytes INTEGER'],
+  ['width', 'ALTER TABLE videos ADD COLUMN width INTEGER'],
+  ['height', 'ALTER TABLE videos ADD COLUMN height INTEGER']
 ];
 for (const [column, sql] of migrations) {
   if (!videoColumns.has(column)) db.exec(sql);

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#050505">
-  <meta name="description" content="LV private video feed">
+  <meta name="description" content="LV private media feed">
   <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex">
   <title>LV</title>
   <link rel="stylesheet" href="/app.css">
@@ -14,7 +14,7 @@
 <body>
   <main id="home" class="home" hidden>
     <nav class="home-nav"><span class="brand">LV</span><button id="home-enter" type="button">Ke Dasbor</button></nav>
-    <section class="home-hero"><span class="brand home-mark">LV</span><p>Private video, simply yours.</p><button id="home-primary" type="button">Ke Dasbor</button></section>
+    <section class="home-hero"><span class="brand home-mark">LV</span><p>Private media, simply yours.</p><button id="home-primary" type="button">Ke Dasbor</button></section>
   </main>
 
   <main id="login" class="login" hidden>
@@ -42,18 +42,23 @@
         <div id="home-video-grid" class="home-video-grid"></div>
         <p id="home-video-empty" class="viewer-search-empty" hidden></p>
       </section>
+      <section class="home-library" aria-labelledby="latest-images-title">
+        <div class="section-heading"><h2 id="latest-images-title">Gambar terbaru</h2><button id="home-see-images" type="button">Lihat semua</button></div>
+        <div id="home-image-grid" class="home-video-grid image-grid"></div>
+        <p id="home-image-empty" class="viewer-search-empty" hidden></p>
+      </section>
     </section>
-    <section id="feed" class="feed" aria-label="Video"></section>
+    <section id="feed" class="feed" aria-label="Media"></section>
     <div id="feed-refresh" class="feed-refresh" aria-hidden="true"><span class="feed-refresh-ring"></span></div>
     <div id="feed-intro" class="feed-intro" role="dialog" aria-modal="true" aria-labelledby="feed-intro-title" hidden>
       <div class="feed-intro-card">
         <span class="brand">LV</span>
         <h2 id="feed-intro-title">Siap menonton?</h2>
         <ul class="feed-intro-list">
-          <li><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v16M8.5 7.5 12 4l3.5 3.5M8.5 16.5 12 20l3.5-3.5"/></svg></span><span><strong>Geser atas &amp; bawah</strong>Pindah ke video berikutnya atau sebelumnya.</span></li>
-          <li><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4.5v15M15 4.5v15"/></svg></span><span><strong>Ketuk video</strong>Jeda lalu lanjutkan lagi kapan saja.</span></li>
+          <li><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v16M8.5 7.5 12 4l3.5 3.5M8.5 16.5 12 20l3.5-3.5"/></svg></span><span><strong>Geser atas &amp; bawah</strong>Pindah ke media berikutnya atau sebelumnya.</span></li>
+          <li><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4.5v15M15 4.5v15"/></svg></span><span><strong>Ketuk media</strong>Jeda video, atau ketuk dua kali gambar untuk memberi love.</span></li>
           <li><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4V5Z" class="solid"/><path d="m16 9.5 5 5m0-5-5 5"/></svg></span><span><strong>Suara mati dulu</strong>Nyalakan lewat tombol suara di kanan.</span></li>
-          <li><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.5 4.5v5.5H16"/><path d="M19.4 15a8.5 8.5 0 1 1-1.9-8.9l4 3.9"/></svg></span><span><strong>Tarik ke bawah</strong>Di video teratas untuk mengacak ulang playlist.</span></li>
+          <li><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.5 4.5v5.5H16"/><path d="M19.4 15a8.5 8.5 0 1 1-1.9-8.9l4 3.9"/></svg></span><span><strong>Tarik ke bawah</strong>Di media teratas untuk mengacak ulang playlist.</span></li>
         </ul>
         <button id="feed-intro-start" type="button">Mulai menonton</button>
         <p id="feed-intro-hint" class="feed-intro-hint" hidden>Ketuk di mana saja untuk melewati<span class="feed-intro-progress"></span></p>
@@ -61,8 +66,12 @@
     </div>
     <section id="search-view" class="search-view" aria-label="Pencarian" hidden>
       <form id="viewer-search-form" class="viewer-search" role="search">
-        <input id="viewer-search" type="search" placeholder="Cari video…" maxlength="80" autocomplete="off" aria-label="Cari berdasarkan kategori, judul, atau deskripsi">
+        <input id="viewer-search" type="search" placeholder="Cari media…" maxlength="80" autocomplete="off" aria-label="Cari berdasarkan kategori, judul, atau deskripsi">
       </form>
+      <nav class="content-tabs" aria-label="Jenis pencarian">
+        <button id="search-type-video" class="active" type="button">Video</button>
+        <button id="search-type-image" type="button">Gambar</button>
+      </nav>
       <div id="search-grid" class="search-grid"></div>
       <p id="viewer-search-empty" class="viewer-search-empty" hidden></p>
     </section>
@@ -77,13 +86,16 @@
         </button>
       </div>
     </section>
-    <div id="empty" class="empty" hidden>Belum ada video.</div>
+    <div id="empty" class="empty" hidden>Belum ada media.</div>
     <nav class="user-tabs" aria-label="Navigasi utama">
       <button id="tab-home" class="active" type="button" aria-label="Beranda" title="Beranda">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 11 9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1v-9Z"/></svg>
       </button>
       <button id="tab-watch" type="button" aria-label="Tonton" title="Tonton">
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m10 9 5 3-5 3V9Z"/></svg>
+      </button>
+      <button id="tab-images" type="button" aria-label="Gambar" title="Gambar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="m5 18 5-5 3 3 2-2 4 4"/></svg>
       </button>
       <button id="tab-search" type="button" aria-label="Cari" title="Cari">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
@@ -98,27 +110,31 @@
     <nav class="admin-nav"><span class="nav-start"><span class="brand">LV</span><button id="admin-home" class="nav-link" type="button">Home</button></span><button id="admin-logout">Keluar</button></nav>
     <section class="admin-shell">
       <p id="admin-status" class="admin-message" aria-live="polite"></p>
+      <nav class="content-tabs admin-media-tabs" aria-label="Jenis konten">
+        <button id="admin-type-video" class="active" type="button">Video</button>
+        <button id="admin-type-image" type="button">Gambar</button>
+      </nav>
       <div class="list-head">
-        <strong>Video <span id="video-count">0</span></strong>
+        <strong id="admin-media-title">Video <span id="video-count">0</span></strong>
         <span class="list-actions">
           <select id="feed-mode" aria-label="Mode feed pengguna">
             <option value="fyp">Feed: FYP</option>
             <option value="shuffle">Feed: Acak</option>
           </select>
-          <button id="sync-videos" type="button">Sync</button><button id="upload-open" class="add-button" type="button" aria-label="Tambah video">+</button>
+          <button id="sync-videos" type="button">Sync</button><button id="upload-open" class="add-button" type="button" aria-label="Tambah media">+</button>
         </span>
       </div>
       <form id="admin-tools" class="admin-tools" role="search">
-        <input id="admin-search" type="search" placeholder="Cari video…" maxlength="80" autocomplete="off" aria-label="Cari judul, keterangan, atau kategori">
+        <input id="admin-search" type="search" placeholder="Cari media…" maxlength="80" autocomplete="off" aria-label="Cari judul, keterangan, atau kategori">
         <select id="admin-category" aria-label="Filter kategori"><option value="">Semua kategori</option></select>
         <select id="admin-status-filter" aria-label="Filter status">
           <option value="">Semua status</option>
           <option value="ready">Siap</option>
-          <option value="unoptimised">Unoptimised</option>
+          <option value="unoptimised">Belum dioptimasi</option>
           <option value="processing">Diproses</option>
           <option value="failed">Gagal</option>
         </select>
-        <select id="admin-sort" aria-label="Urutkan video">
+        <select id="admin-sort" aria-label="Urutkan media">
           <option value="newest">Terbaru</option>
           <option value="oldest">Terlama</option>
           <option value="title-asc">Judul A–Z</option>
@@ -127,7 +143,7 @@
         </select>
       </form>
       <div id="admin-list" class="admin-list"></div>
-      <p id="admin-empty" class="admin-empty" hidden>Tidak ada video yang cocok.</p>
+      <p id="admin-empty" class="admin-empty" hidden>Tidak ada media yang cocok.</p>
       <nav id="pagination" class="pagination" aria-label="Halaman" hidden>
         <button id="page-prev" type="button" aria-label="Sebelumnya">‹</button>
         <span id="page-info">1 / 1</span>
@@ -137,24 +153,25 @@
   </main>
 
   <dialog id="upload-dialog">
-    <form method="dialog" class="dialog-head"><strong>Tambah video</strong><button class="icon-button" aria-label="Tutup">×</button></form>
+    <form method="dialog" class="dialog-head"><strong id="upload-dialog-title">Tambah media</strong><button class="icon-button" aria-label="Tutup">×</button></form>
     <nav class="modal-tabs"><button id="upload-tab" class="active" type="button">Upload</button><button id="url-tab" type="button">URL</button></nav>
     <form id="upload-form" class="modal-form modal-panel">
-      <input id="video-title" placeholder="Judul" maxlength="120">
+      <input id="video-title" placeholder="Judul media" maxlength="120">
       <input id="video-category" placeholder="Kategori: Musik, Live, Favorit" maxlength="240">
       <textarea id="video-caption" placeholder="Keterangan" maxlength="500"></textarea>
       <div id="dropzone" class="dropzone" role="button" tabindex="0">
-        <strong>Tarik video ke sini</strong>
+        <strong id="drop-title">Tarik media ke sini</strong>
         <span id="drop-file">atau klik untuk memilih</span>
-        <input id="video-file" type="file" accept="video/mp4,video/webm,video/quicktime,video/mp2t,.ts" hidden>
+        <input id="video-file" type="file" accept="video/mp4,video/webm,video/quicktime,video/mp2t,image/jpeg,image/png,image/webp,.ts,.jpg,.jpeg,.png,.webp" hidden>
       </div>
-      <button type="submit">Unggah file</button>
+      <small id="upload-hint" class="upload-hint">MP4, WebM, MOV, atau TS maksimum 500 MB.</small>
+      <button id="upload-submit" type="submit">Unggah media</button>
       <progress id="upload-progress" max="100" value="0" hidden></progress>
       <p id="upload-status" class="muted" aria-live="polite"></p>
     </form>
     <form id="url-form" class="modal-form compact-form modal-panel" hidden>
-      <input id="video-url" type="url" inputmode="url" placeholder="https://…/video.mp4" required>
-      <input id="url-title" placeholder="Judul" maxlength="120">
+      <input id="video-url" type="url" inputmode="url" placeholder="https://…/media" required>
+      <input id="url-title" placeholder="Judul media" maxlength="120">
       <input id="url-category" placeholder="Kategori: Musik, Live" maxlength="240">
       <button type="submit">Tambah URL</button>
       <p id="url-status" class="muted" aria-live="polite"></p>
@@ -162,7 +179,7 @@
   </dialog>
 
   <dialog id="metadata-dialog">
-    <form method="dialog" class="dialog-head"><strong>Kelola video</strong><button class="icon-button" aria-label="Tutup">×</button></form>
+    <form method="dialog" class="dialog-head"><strong id="metadata-dialog-title">Kelola video</strong><button class="icon-button" aria-label="Tutup">×</button></form>
     <form id="metadata-form" class="modal-form">
       <div class="thumbnail-editor">
         <img id="metadata-preview" class="metadata-preview" alt="Thumbnail">
@@ -172,16 +189,17 @@
           <button id="frame-capture" type="button">Gunakan frame ini</button>
         </div>
       </div>
-      <input id="metadata-title" placeholder="Judul" maxlength="120" required>
+      <input id="metadata-title" placeholder="Judul media" maxlength="120" required>
       <input id="metadata-category" placeholder="Kategori: Musik, Live, Favorit" maxlength="240">
       <textarea id="metadata-caption" placeholder="Keterangan" maxlength="500"></textarea>
-      <input id="metadata-thumbnail" type="file" accept="image/jpeg,image/png,image/webp">
+      <label id="metadata-thumbnail-row" class="file-field">Thumbnail khusus (opsional)<input id="metadata-thumbnail" type="file" accept="image/jpeg,image/png,image/webp"></label>
       <p id="metadata-status" class="muted" aria-live="polite"></p>
     </form>
     <div class="manage-actions">
       <button id="manage-save" type="submit" form="metadata-form">Simpan</button>
       <button id="manage-preview" type="button">Lihat</button>
       <button id="manage-convert" type="button">Konversi TS</button>
+      <button id="manage-optimize" type="button">Optimasi gambar</button>
       <button id="manage-original" type="button">Hapus MP4</button>
       <button id="manage-delete" class="danger" type="button">Hapus</button>
     </div>
@@ -190,6 +208,7 @@
   <dialog id="preview-dialog">
     <form method="dialog" class="dialog-head"><strong id="preview-title">LV</strong><button class="icon-button" aria-label="Tutup">×</button></form>
     <video id="preview-video" controls playsinline></video>
+    <img id="preview-image" alt="">
   </dialog>
 </body>
 </html>

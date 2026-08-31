@@ -16,20 +16,26 @@ const host = process.env.LV_HOST || '127.0.0.1';
 const port = Number(process.env.LV_PORT || 3100);
 const publicDir = path.join(appRoot, 'public');
 const uploadDir = path.join(dataDir, 'uploads');
+const imageDir = path.join(dataDir, 'images');
 const thumbnailDir = path.join(dataDir, 'thumbnails');
 const hlsDir = path.join(dataDir, 'hls');
 const maxUpload = 500 * 1024 * 1024;
+const maxImageUpload = 25 * 1024 * 1024;
+const maxOptimizedImage = 500 * 1024;
 fs.mkdirSync(uploadDir, { recursive: true, mode: 0o750 });
+fs.mkdirSync(imageDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(thumbnailDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(hlsDir, { recursive: true, mode: 0o750 });
 db.prepare("UPDATE videos SET conversion_status='failed', conversion_error='Proses terhenti saat layanan dimulai ulang.' WHERE conversion_status='converting'").run();
 db.prepare("UPDATE videos SET ingest_status='failed', ingest_error='Download terhenti saat layanan dimulai ulang.' WHERE ingest_status='downloading'").run();
+db.prepare("UPDATE videos SET optimization_status='failed', optimization_error='Optimasi terhenti saat layanan dimulai ulang.' WHERE optimization_status='optimizing'").run();
 
 const mime = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.jpg': 'image/jpeg', '.m3u8': 'application/vnd.apple.mpegurl', '.ts': 'video/mp2t' };
-const appRoutes = new Set(['/', '/login', '/home', '/watch', '/search', '/profile', '/admin']);
+const appRoutes = new Set(['/', '/login', '/home', '/watch', '/images', '/search', '/profile', '/admin']);
 const metadataJobs = new Set();
 const conversionJobs = new Map();
 const remoteJobs = new Map();
+const imageJobs = new Set();
 const thumbnailFilter = 'scale=360:640:force_original_aspect_ratio=increase,crop=360:640';
 const categoryQuery = db.prepare('SELECT categories.name FROM video_categories JOIN categories ON categories.id=video_categories.category_id WHERE video_categories.video_id=? ORDER BY categories.name COLLATE NOCASE');
 
@@ -59,6 +65,7 @@ function setVideoCategories(videoId, value) {
 }
 
 const feedModes = ['fyp', 'shuffle'];
+const publicMediaVisibility = "videos.ingest_status='ready' AND ((videos.media_type='image' AND videos.optimization_status='optimised') OR (videos.media_type='video' AND videos.conversion_status!='converting'))";
 function feedMode() {
   const row = db.prepare("SELECT value FROM settings WHERE key='feed_mode'").get();
   return feedModes.includes(row?.value) ? row.value : 'fyp';
@@ -120,6 +127,7 @@ async function readJson(req, limit = 64 * 1024) {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch { throw new Error('INVALID_JSON'); }
 }
 function cleanVideo(row) {
+  const isImage = row.media_type === 'image';
   const isHls = Boolean(row.hls_manifest);
   const categories = categoryQuery.all(row.id).map(item => item.name);
   return {
@@ -128,30 +136,36 @@ function cleanVideo(row) {
     caption: row.caption,
     category: categories[0] || row.category || 'Umum',
     categories: categories.length ? categories : [row.category || 'Umum'],
+    mediaType: isImage ? 'image' : 'video',
     sourceType: row.source_type,
-    src: row.source_type === 'url' ? row.source : (isHls ? `/hls/${row.id}/index.m3u8` : `/media/${row.id}`),
-    playbackType: isHls ? 'hls' : 'file',
+    src: isImage ? `/media/${row.id}?v=${encodeURIComponent(row.source)}` : (row.source_type === 'url' ? row.source : (isHls ? `/hls/${row.id}/index.m3u8` : `/media/${row.id}`)),
+    playbackType: isImage ? 'image' : (isHls ? 'hls' : 'file'),
     sortOrder: row.sort_order,
     durationSeconds: row.duration_seconds,
     sizeBytes: row.size_bytes,
+    originalSizeBytes: row.original_size_bytes,
+    width: row.width,
+    height: row.height,
     thumbnail: row.thumbnail ? `/thumbnail/${row.id}?v=${encodeURIComponent(row.thumbnail)}` : null,
     conversionStatus: row.conversion_status || 'none',
     conversionError: row.conversion_error || null,
     conversionProgress: conversionJobs.get(Number(row.id))?.progress || 0,
     originalDeleted: Boolean(row.original_deleted),
     originalName: row.source_type === 'upload' ? path.basename(row.source) : null,
-    nativeTs: row.source_type === 'upload' && path.extname(row.source).toLowerCase() === '.ts',
+    nativeTs: !isImage && row.source_type === 'upload' && path.extname(row.source).toLowerCase() === '.ts',
     liked: Boolean(row.liked),
     likeCount: Number(row.like_count || 0),
     ingestStatus: row.ingest_status || 'ready',
     ingestError: row.ingest_error || null,
-    ingestProgress: remoteJobs.get(Number(row.id))?.progress || 0
+    ingestProgress: remoteJobs.get(Number(row.id))?.progress || 0,
+    optimizationStatus: row.optimization_status || 'none',
+    optimizationError: row.optimization_error || null
   };
 }
 async function inspectVideo(id) {
   id = Number(id);
   if (metadataJobs.has(id)) return;
-  const row = db.prepare("SELECT * FROM videos WHERE id=? AND source_type='upload'").get(id);
+  const row = db.prepare("SELECT * FROM videos WHERE id=? AND source_type='upload' AND media_type='video'").get(id);
   if (!row || row.original_deleted) return;
   const input = path.join(uploadDir, path.basename(row.source));
   if (!fs.existsSync(input)) return;
@@ -181,7 +195,7 @@ async function inspectVideo(id) {
 }
 function scheduleMetadata(id) { inspectVideo(id).catch(error => console.error(error)); }
 function syncUploadDirectory() {
-  const known = new Set(db.prepare("SELECT source FROM videos WHERE source_type='upload'").all().map(row => row.source));
+  const known = new Set(db.prepare("SELECT source FROM videos WHERE source_type='upload' AND media_type='video'").all().map(row => row.source));
   const allowed = new Map([['.mp4', 'video/mp4'], ['.webm', 'video/webm'], ['.mov', 'video/quicktime'], ['.ts', 'video/mp2t']]);
   const summary = { added: 0, existing: 0, skipped: 0 };
   for (const file of fs.readdirSync(uploadDir)) {
@@ -208,8 +222,159 @@ function syncUploadDirectory() {
       }
     }
   }
-  for (const row of db.prepare("SELECT id FROM videos WHERE source_type='upload' AND original_deleted=0 AND (duration_seconds IS NULL OR thumbnail IS NULL OR thumbnail_version<2)").all()) scheduleMetadata(row.id);
+  for (const row of db.prepare("SELECT id FROM videos WHERE source_type='upload' AND media_type='video' AND original_deleted=0 AND (duration_seconds IS NULL OR thumbnail IS NULL OR thumbnail_version<2)").all()) scheduleMetadata(row.id);
   return summary;
+}
+const imageMimeByExtension = new Map([['.jpg', 'image/jpeg'], ['.jpeg', 'image/jpeg'], ['.png', 'image/png'], ['.webp', 'image/webp']]);
+
+async function inspectImageFile(input) {
+  const { stdout } = await execFileAsync('/usr/bin/ffprobe', [
+    '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height',
+    '-of', 'json', input
+  ], { maxBuffer: 1024 * 1024 });
+  const stream = JSON.parse(stdout).streams?.[0];
+  if (!stream?.width || !stream?.height) throw new Error('Dimensi gambar tidak terbaca.');
+  return { width: Number(stream.width), height: Number(stream.height) };
+}
+
+async function makeImageThumbnail(input, target) {
+  await execFileAsync('/usr/bin/ffmpeg', [
+    '-y', '-i', input, '-frames:v', '1', '-vf', thumbnailFilter,
+    '-pix_fmt', 'yuvj420p', '-threads', '1', '-q:v', '4', target
+  ], { maxBuffer: 4 * 1024 * 1024 });
+}
+
+async function optimizeImage(id) {
+  id = Number(id);
+  if (imageJobs.has(id)) return;
+  const row = db.prepare("SELECT * FROM videos WHERE id=? AND media_type='image' AND source_type='upload'").get(id);
+  if (!row || row.ingest_status !== 'ready') return;
+  const input = path.join(imageDir, path.basename(row.source));
+  if (!fs.existsSync(input)) {
+    db.prepare("UPDATE videos SET optimization_status='failed', optimization_error='Berkas gambar tidak ditemukan.' WHERE id=?").run(id);
+    return;
+  }
+
+  imageJobs.add(id);
+  db.prepare("UPDATE videos SET optimization_status='optimizing', optimization_error=NULL WHERE id=?").run(id);
+  let working = null;
+  let freshThumbnail = null;
+  try {
+    const inputStat = fs.statSync(input);
+    const originalSize = Number(row.original_size_bytes || inputStat.size);
+    let selected = input;
+    let selectedName = path.basename(row.source);
+    let selectedMime = row.mime_type || imageMimeByExtension.get(path.extname(row.source).toLowerCase()) || 'image/jpeg';
+
+    if (inputStat.size > maxOptimizedImage) {
+      working = path.join(imageDir, `.optimize-${id}-${crypto.randomUUID()}.webp`);
+      const attempts = [
+        { side: 1920, quality: 78 },
+        { side: 1920, quality: 64 },
+        { side: 1600, quality: 50 },
+        { side: 1280, quality: 38 }
+      ];
+      for (const attempt of attempts) {
+        fs.rmSync(working, { force: true });
+        const scale = `scale='min(${attempt.side},iw)':'min(${attempt.side},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`;
+        await execFileAsync('/usr/bin/ffmpeg', [
+          '-y', '-i', input, '-frames:v', '1', '-vf', scale, '-map_metadata', '-1',
+          '-an', '-c:v', 'libwebp', '-preset', 'picture', '-quality', String(attempt.quality),
+          '-compression_level', '4', '-threads', '1', working
+        ], { maxBuffer: 8 * 1024 * 1024 });
+        if (fs.statSync(working).size <= maxOptimizedImage) break;
+      }
+      if (!fs.existsSync(working) || fs.statSync(working).size > maxOptimizedImage) {
+        throw new Error('Gambar tidak dapat diperkecil hingga 500 KB.');
+      }
+      selected = working;
+      selectedName = `${crypto.randomUUID()}.webp`;
+      selectedMime = 'image/webp';
+    }
+
+    const dimensions = await inspectImageFile(selected);
+    const thumbnailName = `${id}-${Date.now()}.jpg`;
+    freshThumbnail = path.join(thumbnailDir, thumbnailName);
+    await makeImageThumbnail(selected, freshThumbnail);
+
+    let finalPath = input;
+    if (selected !== input) {
+      finalPath = path.join(imageDir, selectedName);
+      fs.renameSync(selected, finalPath);
+      working = null;
+      fs.rmSync(input, { force: true });
+    }
+    if (row.thumbnail) fs.rmSync(path.join(thumbnailDir, path.basename(row.thumbnail)), { force: true });
+    db.prepare(`UPDATE videos SET source=?, mime_type=?, size_bytes=?, original_size_bytes=?,
+      width=?, height=?, thumbnail=?, thumbnail_version=2, optimization_status='optimised',
+      optimization_error=NULL WHERE id=?`).run(
+      selectedName, selectedMime, fs.statSync(finalPath).size, originalSize,
+      dimensions.width, dimensions.height, thumbnailName, id
+    );
+    freshThumbnail = null;
+  } catch (error) {
+    console.error(`image optimize ${id}:`, error.message);
+    db.prepare("UPDATE videos SET optimization_status='failed', optimization_error=? WHERE id=?").run(String(error.message || 'Optimasi gagal.').slice(0, 500), id);
+  } finally {
+    if (working) fs.rmSync(working, { force: true });
+    if (freshThumbnail) fs.rmSync(freshThumbnail, { force: true });
+    imageJobs.delete(id);
+  }
+}
+
+function scheduleImageOptimization(id) {
+  optimizeImage(id).catch(error => console.error(error));
+}
+
+function syncImageDirectory() {
+  const known = new Set(db.prepare("SELECT source FROM videos WHERE source_type='upload' AND media_type='image'").all().map(row => row.source));
+  const summary = { added: 0, existing: 0, skipped: 0 };
+  for (const file of fs.readdirSync(imageDir)) {
+    if (file.startsWith('.')) { summary.skipped += 1; continue; }
+    const extension = path.extname(file).toLowerCase();
+    const originalPath = path.join(imageDir, file);
+    let isFile = false;
+    try { isFile = fs.statSync(originalPath).isFile(); } catch { /* berkas berpindah saat sync */ }
+    if (!isFile || !imageMimeByExtension.has(extension)) { summary.skipped += 1; continue; }
+    if (known.has(file)) { summary.existing += 1; continue; }
+
+    const title = path.basename(file, extension).replace(/[-_]+/g, ' ').trim() || 'LV';
+    const randomName = `${crypto.randomUUID()}${extension}`;
+    const randomPath = path.join(imageDir, randomName);
+    try {
+      const stat = fs.statSync(originalPath);
+      if (stat.size > maxImageUpload) throw new Error('Ukuran gambar melebihi 25 MB.');
+      fs.renameSync(originalPath, randomPath);
+      const result = db.prepare(`INSERT INTO videos
+        (title, caption, source_type, source, mime_type, sort_order, media_type,
+         size_bytes, original_size_bytes, optimization_status)
+        VALUES (?, ?, 'upload', ?, ?, ?, 'image', ?, ?, 'unoptimised')`)
+        .run(title.slice(0, 120), '', randomName, imageMimeByExtension.get(extension), Date.now(), stat.size, stat.size);
+      setVideoCategories(result.lastInsertRowid, ['Umum']);
+      scheduleImageOptimization(result.lastInsertRowid);
+      summary.added += 1;
+    } catch (error) {
+      if (fs.existsSync(randomPath) && !fs.existsSync(originalPath)) fs.renameSync(randomPath, originalPath);
+      console.error(`sync image ${file}:`, error.message);
+      summary.skipped += 1;
+    }
+  }
+  for (const row of db.prepare("SELECT id FROM videos WHERE media_type='image' AND source_type='upload' AND ingest_status='ready' AND optimization_status IN ('none','unoptimised')").all()) {
+    scheduleImageOptimization(row.id);
+  }
+  return summary;
+}
+
+function syncMediaDirectories() {
+  const videos = syncUploadDirectory();
+  const images = syncImageDirectory();
+  return {
+    added: videos.added + images.added,
+    existing: videos.existing + images.existing,
+    skipped: videos.skipped + images.skipped,
+    videos,
+    images
+  };
 }
 function isPrivateAddress(address) {
   if (net.isIPv4(address)) {
@@ -248,36 +413,75 @@ async function downloadRemote(row, sourceUrl) {
   const id = Number(row.id);
   const job = { progress: 0, controller: new AbortController() };
   remoteJobs.set(id, job);
-  const temporary = path.join(uploadDir, path.basename(row.source));
+  const temporary = path.join(dataDir, `.remote-${id}-${crypto.randomUUID()}.part`);
   let output;
   try {
     const { response, finalUrl } = await fetchRemote(sourceUrl, job.controller.signal);
     const type = String(response.headers.get('content-type') || '').split(';')[0].toLowerCase();
-    const typeExtensions = { 'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov', 'video/mp2t': '.ts' };
+    const detailsByType = {
+      'video/mp4': { extension: '.mp4', mediaType: 'video' },
+      'video/webm': { extension: '.webm', mediaType: 'video' },
+      'video/quicktime': { extension: '.mov', mediaType: 'video' },
+      'video/mp2t': { extension: '.ts', mediaType: 'video' },
+      'image/jpeg': { extension: '.jpg', mediaType: 'image' },
+      'image/png': { extension: '.png', mediaType: 'image' },
+      'image/webp': { extension: '.webp', mediaType: 'image' }
+    };
+    const detailsByExtension = {
+      '.mp4': { type: 'video/mp4', mediaType: 'video' },
+      '.webm': { type: 'video/webm', mediaType: 'video' },
+      '.mov': { type: 'video/quicktime', mediaType: 'video' },
+      '.ts': { type: 'video/mp2t', mediaType: 'video' },
+      '.jpg': { type: 'image/jpeg', mediaType: 'image' },
+      '.jpeg': { type: 'image/jpeg', mediaType: 'image' },
+      '.png': { type: 'image/png', mediaType: 'image' },
+      '.webp': { type: 'image/webp', mediaType: 'image' }
+    };
     const urlExtension = path.extname(new URL(finalUrl).pathname).toLowerCase();
-    const extensionTypes = { '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.ts': 'video/mp2t' };
-    const extension = typeExtensions[type] || (extensionTypes[urlExtension] ? urlExtension : null);
-    const mimeType = typeExtensions[type] ? type : extensionTypes[urlExtension];
-    if (!extension || !mimeType) throw new Error('URL bukan berkas MP4, WebM, MOV, atau TS.');
+    const typed = detailsByType[type];
+    const extended = detailsByExtension[urlExtension];
+    const extension = typed?.extension || (extended ? urlExtension : null);
+    const mediaType = typed?.mediaType || extended?.mediaType;
+    const mimeType = typed ? type : extended?.type;
+    if (!extension || !mimeType || !mediaType) throw new Error('URL bukan berkas video atau gambar yang didukung.');
+    if (row.media_type && row.media_type !== mediaType) throw new Error(`URL tersebut bukan ${row.media_type === 'image' ? 'gambar' : 'video'}.`);
+
+    const limit = mediaType === 'image' ? maxImageUpload : maxUpload;
+    const sizeLabel = mediaType === 'image' ? '25 MB' : '500 MB';
     const declaredLength = Number(response.headers.get('content-length') || 0);
-    if (declaredLength > maxUpload) throw new Error('Ukuran video melebihi 500 MB.');
+    if (declaredLength > limit) throw new Error(`Ukuran ${mediaType === 'image' ? 'gambar' : 'video'} melebihi ${sizeLabel}.`);
     output = fs.createWriteStream(temporary, { mode: 0o640, flags: 'wx' });
     let received = 0;
     for await (const chunk of response.body) {
-      received += chunk.length; if (received > maxUpload) throw new Error('Ukuran video melebihi 500 MB.');
+      received += chunk.length;
+      if (received > limit) throw new Error(`Ukuran ${mediaType === 'image' ? 'gambar' : 'video'} melebihi ${sizeLabel}.`);
       job.progress = declaredLength ? Math.min(99, Math.round(received / declaredLength * 100)) : 0;
       if (!output.write(chunk)) await new Promise(resolve => output.once('drain', resolve));
     }
     await new Promise((resolve, reject) => { output.end(resolve); output.on('error', reject); });
+
     const filename = `${crypto.randomUUID()}${extension}`;
-    fs.renameSync(temporary, path.join(uploadDir, filename));
-    db.prepare("UPDATE videos SET source=?, mime_type=?, source_url=?, ingest_status='ready', ingest_error=NULL WHERE id=?").run(filename, mimeType, finalUrl, id);
-    scheduleMetadata(id);
+    const destination = path.join(mediaType === 'image' ? imageDir : uploadDir, filename);
+    fs.renameSync(temporary, destination);
+    db.prepare(`UPDATE videos SET source=?, mime_type=?, source_url=?, media_type=?,
+      size_bytes=?, original_size_bytes=?, ingest_status='ready', ingest_error=NULL,
+      optimization_status=? WHERE id=?`).run(
+      filename, mimeType, finalUrl, mediaType, received,
+      mediaType === 'image' ? received : null,
+      mediaType === 'image' ? 'unoptimised' : 'none', id
+    );
+    if (mediaType === 'image') scheduleImageOptimization(id); else scheduleMetadata(id);
   } catch (error) {
-    output?.destroy(); fs.rmSync(temporary, { force: true });
-    if (db.prepare('SELECT 1 FROM videos WHERE id=?').get(id)) db.prepare("UPDATE videos SET ingest_status='failed', ingest_error=? WHERE id=?").run((error.name === 'AbortError' ? 'Download dibatalkan.' : error.message).slice(0, 500), id);
-  } finally { remoteJobs.delete(id); }
+    output?.destroy();
+    fs.rmSync(temporary, { force: true });
+    if (db.prepare('SELECT 1 FROM videos WHERE id=?').get(id)) {
+      db.prepare("UPDATE videos SET ingest_status='failed', ingest_error=? WHERE id=?").run((error.name === 'AbortError' ? 'Download dibatalkan.' : error.message).slice(0, 500), id);
+    }
+  } finally {
+    remoteJobs.delete(id);
+  }
 }
+
 function serveStatic(req, res, name) {
   const file = path.join(publicDir, name);
   fs.readFile(file, (error, data) => {
@@ -296,11 +500,13 @@ function servePrivateFile(req, res, file, contentType, cache = 'private, max-age
 }
 function serveMedia(req, res, id) {
   const user = requireUser(req, res); if (!user) return;
-  const video = db.prepare("SELECT source, mime_type, conversion_status, ingest_status FROM videos WHERE id=? AND source_type='upload'").get(id);
-  if (!video) return json(res, 404, { error: 'Video tidak ditemukan.' });
-  if (video.ingest_status !== 'ready') return json(res, 404, { error: 'Video belum tersedia.' });
+  const video = db.prepare("SELECT source, mime_type, media_type, conversion_status, optimization_status, ingest_status FROM videos WHERE id=? AND source_type='upload'").get(id);
+  if (!video) return json(res, 404, { error: 'Media tidak ditemukan.' });
+  if (video.ingest_status !== 'ready') return json(res, 404, { error: 'Media belum tersedia.' });
+  if (video.media_type === 'image' && user.role !== 'admin' && video.optimization_status !== 'optimised') return json(res, 404, { error: 'Gambar belum tersedia.' });
   if (user.role !== 'admin' && video.conversion_status === 'converting') return json(res, 404, { error: 'Video belum tersedia.' });
-  const file = path.join(uploadDir, path.basename(video.source));
+  const file = path.join(video.media_type === 'image' ? imageDir : uploadDir, path.basename(video.source));
+  if (video.media_type === 'image') return servePrivateFile(req, res, file, video.mime_type || 'image/jpeg');
   let stat; try { stat = fs.statSync(file); } catch { return json(res, 404, { error: 'Berkas tidak ditemukan.' }); }
   const range = req.headers.range;
   if (!range) {
@@ -322,30 +528,57 @@ async function upload(req, res, url) {
   if (!requireUser(req, res, 'admin')) return;
   const length = Number(req.headers['content-length'] || 0);
   const type = String(req.headers['content-type'] || '').split(';')[0];
-  if (!['video/mp4', 'video/webm', 'video/quicktime', 'video/mp2t'].includes(type)) return json(res, 415, { error: 'Gunakan MP4, WebM, MOV, atau TS.' });
-  if (!length || length > maxUpload) return json(res, 413, { error: 'Ukuran maksimum 500 MB.' });
-  const extension = { 'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov', 'video/mp2t': '.ts' }[type];
-  const filename = `${crypto.randomUUID()}${extension}`;
-  const target = path.join(uploadDir, filename);
+  const supported = {
+    'video/mp4': { extension: '.mp4', mediaType: 'video' },
+    'video/webm': { extension: '.webm', mediaType: 'video' },
+    'video/quicktime': { extension: '.mov', mediaType: 'video' },
+    'video/mp2t': { extension: '.ts', mediaType: 'video' },
+    'image/jpeg': { extension: '.jpg', mediaType: 'image' },
+    'image/png': { extension: '.png', mediaType: 'image' },
+    'image/webp': { extension: '.webp', mediaType: 'image' }
+  };
+  const detail = supported[type];
+  if (!detail) return json(res, 415, { error: 'Gunakan MP4, WebM, MOV, TS, JPG, PNG, atau WebP.' });
+  const limit = detail.mediaType === 'image' ? maxImageUpload : maxUpload;
+  if (!length || length > limit) return json(res, 413, { error: `Ukuran maksimum ${detail.mediaType === 'image' ? '25 MB' : '500 MB'}.` });
+
+  const filename = `${crypto.randomUUID()}${detail.extension}`;
+  const target = path.join(detail.mediaType === 'image' ? imageDir : uploadDir, filename);
   let received = 0;
   const output = fs.createWriteStream(target, { mode: 0o640, flags: 'wx' });
   try {
-    for await (const chunk of req) { received += chunk.length; if (received > maxUpload) throw new Error('TOO_LARGE'); if (!output.write(chunk)) await new Promise(resolve => output.once('drain', resolve)); }
+    for await (const chunk of req) {
+      received += chunk.length;
+      if (received > limit) throw new Error('TOO_LARGE');
+      if (!output.write(chunk)) await new Promise(resolve => output.once('drain', resolve));
+    }
     await new Promise((resolve, reject) => { output.end(resolve); output.on('error', reject); });
     const title = (url.searchParams.get('title') || 'Tanpa judul').slice(0, 120);
     const caption = (url.searchParams.get('caption') || '').slice(0, 500);
-    const category = (url.searchParams.get('category') || 'Umum').trim().slice(0, 40) || 'Umum';
-    const result = db.prepare('INSERT INTO videos (title, caption, category, source_type, source, mime_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)').run(title, caption, category, 'upload', filename, type, Date.now());
-    setVideoCategories(result.lastInsertRowid, category);
-    scheduleMetadata(result.lastInsertRowid);
+    const categories = normalizeCategories(url.searchParams.get('category') || 'Umum');
+    const result = db.prepare(`INSERT INTO videos
+      (title, caption, category, source_type, source, mime_type, sort_order, media_type,
+       size_bytes, original_size_bytes, optimization_status)
+      VALUES (?, ?, ?, 'upload', ?, ?, ?, ?, ?, ?, ?)`).run(
+      title, caption, categories[0], filename, type, Date.now(), detail.mediaType,
+      received, detail.mediaType === 'image' ? received : null,
+      detail.mediaType === 'image' ? 'unoptimised' : 'none'
+    );
+    setVideoCategories(result.lastInsertRowid, categories);
+    if (detail.mediaType === 'image') scheduleImageOptimization(result.lastInsertRowid);
+    else scheduleMetadata(result.lastInsertRowid);
     json(res, 201, cleanVideo(db.prepare('SELECT * FROM videos WHERE id=?').get(result.lastInsertRowid)));
-  } catch (error) { output.destroy(); fs.rmSync(target, { force: true }); json(res, error.message === 'TOO_LARGE' ? 413 : 500, { error: 'Upload gagal.' }); }
+  } catch (error) {
+    output.destroy();
+    fs.rmSync(target, { force: true });
+    json(res, error.message === 'TOO_LARGE' ? 413 : 500, { error: 'Upload gagal.' });
+  }
 }
 
 async function replaceThumbnail(req, res, id) {
   if (!requireUser(req, res, 'admin')) return;
   const row = db.prepare('SELECT * FROM videos WHERE id=?').get(id);
-  if (!row) return json(res, 404, { error: 'Video tidak ditemukan.' });
+  if (!row) return json(res, 404, { error: 'Media tidak ditemukan.' });
   const length = Number(req.headers['content-length'] || 0);
   const type = String(req.headers['content-type'] || '').split(';')[0];
   const extensions = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' };
@@ -372,7 +605,7 @@ async function replaceThumbnail(req, res, id) {
 async function captureThumbnail(req, res, id) {
   if (!requireUser(req, res, 'admin')) return;
   const row = db.prepare('SELECT * FROM videos WHERE id=?').get(id);
-  if (!row) return json(res, 404, { error: 'Video tidak ditemukan.' });
+  if (!row) return json(res, 404, { error: 'Media tidak ditemukan.' });
   const body = await readJson(req);
   const requestedTime = Number(body.time || 0);
   const time = Math.max(0, Math.min(Number.isFinite(requestedTime) ? requestedTime : 0, Math.max(0, Number(row.duration_seconds || 0) - 0.05)));
@@ -480,21 +713,29 @@ async function route(req, res) {
   }
   if (req.method === 'GET' && url.pathname === '/api/categories') {
     if (!requireUser(req, res)) return;
+    const mediaType = ['video', 'image'].includes(url.searchParams.get('type')) ? url.searchParams.get('type') : null;
+    const sampleMediaClause = mediaType ? `AND sample_videos.media_type='${mediaType}'` : '';
+    const categoryMediaClause = mediaType ? `AND videos.media_type='${mediaType}'` : '';
     const categories = db.prepare(`SELECT categories.name, COUNT(*) AS video_count,
       (SELECT sample_videos.id FROM video_categories sample_video_categories
         JOIN videos sample_videos ON sample_videos.id=sample_video_categories.video_id
         WHERE sample_video_categories.category_id=categories.id
           AND sample_videos.ingest_status='ready' AND sample_videos.conversion_status!='converting'
+          AND (sample_videos.media_type='video' OR sample_videos.optimization_status='optimised')
           AND sample_videos.thumbnail IS NOT NULL
+          ${sampleMediaClause}
         ORDER BY sample_videos.sort_order DESC, sample_videos.id DESC LIMIT 1) AS thumbnail_id
       FROM categories
       JOIN video_categories ON video_categories.category_id=categories.id
       JOIN videos ON videos.id=video_categories.video_id
       WHERE videos.ingest_status='ready' AND videos.conversion_status!='converting'
+        AND (videos.media_type='video' OR videos.optimization_status='optimised')
+      ${categoryMediaClause}
       GROUP BY categories.id, categories.name
       ORDER BY video_count DESC, categories.name COLLATE NOCASE LIMIT 12`).all().map(category => ({
         name: category.name,
         videoCount: Number(category.video_count),
+        mediaCount: Number(category.video_count),
         thumbnail: category.thumbnail_id ? `/thumbnail/${category.thumbnail_id}` : null
       }));
     return json(res, 200, { categories });
@@ -505,7 +746,12 @@ async function route(req, res) {
     if (Number.isFinite(requestedPage) && requestedPage > 0) {
       const limit = Math.min(50, Math.max(1, Number.parseInt(url.searchParams.get('limit') || '10', 10) || 10));
       const clauses = []; const parameters = [];
-      if (user.role !== 'admin') clauses.push("videos.conversion_status!='converting' AND videos.ingest_status='ready'");
+      if (user.role !== 'admin') clauses.push(publicMediaVisibility);
+      const mediaType = url.searchParams.get('type');
+      if (mediaType === 'video' || mediaType === 'image') {
+        clauses.push('videos.media_type=?');
+        parameters.push(mediaType);
+      }
       const category = String(url.searchParams.get('category') || '').trim().slice(0, 40);
       if (category) {
         clauses.push(`EXISTS (SELECT 1 FROM video_categories filter_video_categories
@@ -527,10 +773,10 @@ async function route(req, res) {
       if (user.role === 'admin') {
         const status = url.searchParams.get('status') || '';
         const statusClauses = {
-          ready: "videos.ingest_status='ready' AND videos.conversion_status='converted'",
-          unoptimised: "videos.ingest_status='ready' AND videos.conversion_status NOT IN ('converted','converting','failed') AND videos.duration_seconds IS NOT NULL AND lower(videos.source) NOT LIKE '%.ts'",
-          processing: "videos.ingest_status='downloading' OR videos.conversion_status='converting' OR (videos.ingest_status='ready' AND videos.duration_seconds IS NULL)",
-          failed: "videos.ingest_status='failed' OR videos.conversion_status='failed'"
+          ready: "videos.ingest_status='ready' AND ((videos.media_type='image' AND videos.optimization_status='optimised') OR (videos.media_type='video' AND videos.conversion_status='converted'))",
+          unoptimised: "videos.ingest_status='ready' AND ((videos.media_type='image' AND videos.optimization_status IN ('none','unoptimised')) OR (videos.media_type='video' AND videos.conversion_status NOT IN ('converted','converting','failed') AND videos.duration_seconds IS NOT NULL AND lower(videos.source) NOT LIKE '%.ts'))",
+          processing: "videos.ingest_status='downloading' OR videos.conversion_status='converting' OR videos.optimization_status='optimizing' OR (videos.media_type='video' AND videos.ingest_status='ready' AND videos.duration_seconds IS NULL)",
+          failed: "videos.ingest_status='failed' OR videos.conversion_status='failed' OR videos.optimization_status='failed'"
         };
         if (Object.hasOwn(statusClauses, status)) clauses.push(`(${statusClauses[status]})`);
       }
@@ -582,11 +828,13 @@ async function route(req, res) {
       const facets = user.role === 'admin' ? {
         categories: db.prepare(`SELECT DISTINCT categories.name FROM categories
           JOIN video_categories ON video_categories.category_id=categories.id
+          JOIN videos ON videos.id=video_categories.video_id
+          ${mediaType ? `WHERE videos.media_type='${mediaType}'` : ''}
           ORDER BY categories.name COLLATE NOCASE`).all().map(item => item.name)
       } : null;
       return json(res, 200, { videos: rows.map(cleanVideo), pagination: { page, limit, total, totalPages }, facets });
     }
-    const visibility = user.role === 'admin' ? '' : "WHERE videos.conversion_status!='converting' AND videos.ingest_status='ready'";
+    const visibility = user.role === 'admin' ? '' : `WHERE ${publicMediaVisibility}`;
     const select = `SELECT videos.*,
       EXISTS(SELECT 1 FROM video_likes WHERE video_likes.user_id=? AND video_likes.video_id=videos.id) AS liked,
       (SELECT COUNT(*) FROM video_likes WHERE video_likes.video_id=videos.id) AS like_count
@@ -596,16 +844,18 @@ async function route(req, res) {
   }
   if (req.method === 'POST' && url.pathname === '/api/videos/sync') {
     if (!requireUser(req, res, 'admin')) return;
-    return json(res, 200, syncUploadDirectory());
+    const mediaType = url.searchParams.get('type');
+    return json(res, 200, mediaType === 'image' ? syncImageDirectory() : mediaType === 'video' ? syncUploadDirectory() : syncMediaDirectories());
   }
   if (req.method === 'POST' && url.pathname === '/api/videos/upload') return upload(req, res, url);
   if (req.method === 'POST' && url.pathname === '/api/videos/url') {
     if (!requireUser(req, res, 'admin')) return; const body = await readJson(req); let source;
-    try { source = await validateRemoteUrl(String(body.url)); } catch (error) { return json(res, 400, { error: error.message || 'URL video tidak valid.' }); }
+    try { source = await validateRemoteUrl(String(body.url)); } catch (error) { return json(res, 400, { error: error.message || 'URL media tidak valid.' }); }
     const fallbackTitle = path.basename(source.pathname, path.extname(source.pathname)).replace(/[-_]+/g, ' ').trim() || 'Tanpa judul';
     const temporary = `${crypto.randomUUID()}.part`;
     const categories = normalizeCategories(body.categories || body.category);
-    const result = db.prepare("INSERT INTO videos (title,caption,category,source_type,source,sort_order,source_url,ingest_status) VALUES (?,?,?,?,?,?,?,'downloading')").run(String(body.title || fallbackTitle).slice(0,120), String(body.caption || '').slice(0,500), categories[0], 'upload', temporary, Date.now(), source.href);
+    const requestedMediaType = body.mediaType === 'image' ? 'image' : 'video';
+    const result = db.prepare("INSERT INTO videos (title,caption,category,source_type,source,sort_order,source_url,ingest_status,media_type,optimization_status) VALUES (?,?,?,?,?,?,?,'downloading',?,?)").run(String(body.title || fallbackTitle).slice(0,120), String(body.caption || '').slice(0,500), categories[0], 'upload', temporary, Date.now(), source.href, requestedMediaType, requestedMediaType === 'image' ? 'unoptimised' : 'none');
     setVideoCategories(result.lastInsertRowid, categories);
     const row = db.prepare('SELECT * FROM videos WHERE id=?').get(result.lastInsertRowid);
     downloadRemote(row, source.href).catch(error => console.error(error));
@@ -614,18 +864,18 @@ async function route(req, res) {
   const editMatch = /^\/api\/videos\/(\d+)$/.exec(url.pathname);
   if (req.method === 'GET' && editMatch) {
     const user = requireUser(req, res); if (!user) return;
-    const visibility = user.role === 'admin' ? '' : " AND conversion_status!='converting' AND ingest_status='ready'";
+    const visibility = user.role === 'admin' ? '' : ` AND ${publicMediaVisibility}`;
     const row = db.prepare(`SELECT videos.*,
       EXISTS(SELECT 1 FROM video_likes WHERE video_likes.user_id=? AND video_likes.video_id=videos.id) AS liked,
       (SELECT COUNT(*) FROM video_likes WHERE video_likes.video_id=videos.id) AS like_count
       FROM videos WHERE id=?${visibility}`).get(user.id, editMatch[1]);
-    if (!row) return json(res, 404, { error: 'Video tidak ditemukan.' });
+    if (!row) return json(res, 404, { error: 'Media tidak ditemukan.' });
     return json(res, 200, { video: cleanVideo(row) });
   }
   if (req.method === 'PATCH' && editMatch) {
     if (!requireUser(req, res, 'admin')) return;
     const row = db.prepare('SELECT id FROM videos WHERE id=?').get(editMatch[1]);
-    if (!row) return json(res, 404, { error: 'Video tidak ditemukan.' });
+    if (!row) return json(res, 404, { error: 'Media tidak ditemukan.' });
     const body = await readJson(req);
     const title = String(body.title || '').trim().slice(0, 120);
     if (!title) return json(res, 400, { error: 'Judul wajib diisi.' });
@@ -639,10 +889,21 @@ async function route(req, res) {
   if (req.method === 'POST' && thumbnailUploadMatch) return replaceThumbnail(req, res, thumbnailUploadMatch[1]);
   const thumbnailFrameMatch = /^\/api\/videos\/(\d+)\/thumbnail\/frame$/.exec(url.pathname);
   if (req.method === 'POST' && thumbnailFrameMatch) return captureThumbnail(req, res, thumbnailFrameMatch[1]);
+  const optimizeMatch = /^\/api\/videos\/(\d+)\/optimize$/.exec(url.pathname);
+  if (req.method === 'POST' && optimizeMatch) {
+    if (!requireUser(req, res, 'admin')) return;
+    const row = db.prepare("SELECT * FROM videos WHERE id=? AND source_type='upload' AND media_type='image'").get(optimizeMatch[1]);
+    if (!row) return json(res, 404, { error: 'Gambar lokal tidak ditemukan.' });
+    if (row.ingest_status !== 'ready') return json(res, 409, { error: 'Download belum selesai.' });
+    if (!fs.existsSync(path.join(imageDir, path.basename(row.source)))) return json(res, 409, { error: 'Berkas gambar tidak tersedia.' });
+    if (imageJobs.has(Number(row.id)) || row.optimization_status === 'optimizing') return json(res, 409, { error: 'Optimasi sedang berjalan.' });
+    scheduleImageOptimization(row.id);
+    return json(res, 202, { ok: true });
+  }
   const convertMatch = /^\/api\/videos\/(\d+)\/convert$/.exec(url.pathname);
   if (req.method === 'POST' && convertMatch) {
     if (!requireUser(req, res, 'admin')) return;
-    const row = db.prepare("SELECT * FROM videos WHERE id=? AND source_type='upload'").get(convertMatch[1]);
+    const row = db.prepare("SELECT * FROM videos WHERE id=? AND source_type='upload' AND media_type='video'").get(convertMatch[1]);
     if (!row) return json(res, 404, { error: 'Video lokal tidak ditemukan.' });
     if (row.ingest_status !== 'ready') return json(res, 409, { error: 'Download belum selesai.' });
     if (row.original_deleted || !fs.existsSync(path.join(uploadDir, path.basename(row.source)))) return json(res, 409, { error: 'MP4 asli tidak tersedia.' });
@@ -655,8 +916,8 @@ async function route(req, res) {
   const originalMatch = /^\/api\/videos\/(\d+)\/original$/.exec(url.pathname);
   if (req.method === 'DELETE' && originalMatch) {
     if (!requireUser(req, res, 'admin')) return;
-    const row = db.prepare("SELECT * FROM videos WHERE id=? AND source_type='upload'").get(originalMatch[1]);
-    if (!row) return json(res, 404, { error: 'Video tidak ditemukan.' });
+    const row = db.prepare("SELECT * FROM videos WHERE id=? AND source_type='upload' AND media_type='video'").get(originalMatch[1]);
+    if (!row) return json(res, 404, { error: 'Media tidak ditemukan.' });
     if (path.extname(row.source).toLowerCase() === '.ts') return json(res, 409, { error: 'Berkas ini berasal dari TS.' });
     if (row.conversion_status !== 'converted' || !row.hls_manifest) return json(res, 409, { error: 'Konversi HLS belum selesai.' });
     fs.rmSync(path.join(uploadDir, path.basename(row.source)), { force: true });
@@ -666,7 +927,7 @@ async function route(req, res) {
   const viewMatch = /^\/api\/videos\/(\d+)\/view$/.exec(url.pathname);
   if (req.method === 'POST' && viewMatch) {
     const user = requireUser(req, res); if (!user) return;
-    if (!db.prepare('SELECT 1 FROM videos WHERE id=?').get(viewMatch[1])) return json(res, 404, { error: 'Video tidak ditemukan.' });
+    if (!db.prepare('SELECT 1 FROM videos WHERE id=?').get(viewMatch[1])) return json(res, 404, { error: 'Media tidak ditemukan.' });
     db.prepare(`INSERT INTO video_views (user_id,video_id,viewed_at,view_count) VALUES (?,?,?,1)
       ON CONFLICT(user_id,video_id) DO UPDATE SET viewed_at=excluded.viewed_at, view_count=view_count+1`).run(user.id, Number(viewMatch[1]), Date.now());
     return json(res, 200, { ok: true });
@@ -674,7 +935,7 @@ async function route(req, res) {
   const likeMatch = /^\/api\/videos\/(\d+)\/like$/.exec(url.pathname);
   if ((req.method === 'POST' || req.method === 'DELETE') && likeMatch) {
     const user = requireUser(req, res); if (!user) return;
-    if (!db.prepare('SELECT 1 FROM videos WHERE id=?').get(likeMatch[1])) return json(res, 404, { error: 'Video tidak ditemukan.' });
+    if (!db.prepare('SELECT 1 FROM videos WHERE id=?').get(likeMatch[1])) return json(res, 404, { error: 'Media tidak ditemukan.' });
     if (req.method === 'POST') db.prepare('INSERT OR IGNORE INTO video_likes (user_id,video_id) VALUES (?,?)').run(user.id, likeMatch[1]);
     else db.prepare('DELETE FROM video_likes WHERE user_id=? AND video_id=?').run(user.id, likeMatch[1]);
     const count = db.prepare('SELECT COUNT(*) AS count FROM video_likes WHERE video_id=?').get(likeMatch[1]).count;
@@ -683,11 +944,12 @@ async function route(req, res) {
   const deleteMatch = /^\/api\/videos\/(\d+)$/.exec(url.pathname);
   if (req.method === 'DELETE' && deleteMatch) {
     if (!requireUser(req, res, 'admin')) return; const row = db.prepare('SELECT * FROM videos WHERE id=?').get(deleteMatch[1]);
-    if (!row) return json(res, 404, { error: 'Video tidak ditemukan.' });
+    if (!row) return json(res, 404, { error: 'Media tidak ditemukan.' });
     if (conversionJobs.has(Number(row.id))) return json(res, 409, { error: 'Tunggu konversi selesai.' });
+    if (imageJobs.has(Number(row.id))) return json(res, 409, { error: 'Tunggu optimasi selesai.' });
     if (remoteJobs.has(Number(row.id))) remoteJobs.get(Number(row.id)).controller.abort();
     db.prepare('DELETE FROM videos WHERE id=?').run(row.id);
-    if (row.source_type === 'upload') fs.rmSync(path.join(uploadDir, path.basename(row.source)), { force: true });
+    if (row.source_type === 'upload') fs.rmSync(path.join(row.media_type === 'image' ? imageDir : uploadDir, path.basename(row.source)), { force: true });
     if (row.thumbnail) fs.rmSync(path.join(thumbnailDir, path.basename(row.thumbnail)), { force: true });
     fs.rmSync(path.join(hlsDir, String(row.id)), { recursive: true, force: true });
     return json(res, 200, { ok: true });

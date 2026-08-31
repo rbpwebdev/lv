@@ -1,5 +1,5 @@
 const $ = selector => document.querySelector(selector);
-const state = { user: null, videos: [], homeVideos: [], homePagination: null, homeLoadId: 0, viewerPage: 1, viewerPagination: null, viewerCategory: '', viewerQuery: '', viewerSeed: 0, viewerSince: 0, viewerStartId: 0, viewerLoading: false, viewerLoadId: 0, feedReady: false, feedIntroTimer: null, lapStart: 0, feedEnded: false, searchQuery: '', searchVideos: [], searchPage: 1, searchPagination: null, searchLoading: false, searchLoadId: 0, searchTimer: null, adminTimer: null, adminSearchTimer: null, adminLoadId: 0, adminFilters: { q: '', category: '', status: '', sort: 'newest' }, page: 1, pagination: null, manageVideo: null, uploadFile: null, route: '', muted: readStore('lv-muted') !== '0' };
+const state = { user: null, videos: [], homeVideos: [], homePagination: null, homeLoadId: 0, viewerPage: 1, viewerPagination: null, viewerCategory: '', viewerQuery: '', viewerSeed: 0, viewerSince: 0, viewerStartId: 0, viewerLoading: false, viewerLoadId: 0, viewerMediaType: 'video', searchMediaType: 'video', adminMediaType: 'video', feedReady: false, feedIntroTimer: null, lapStart: 0, feedEnded: false, searchQuery: '', searchVideos: [], searchPage: 1, searchPagination: null, searchLoading: false, searchLoadId: 0, searchTimer: null, adminTimer: null, adminSearchTimer: null, adminLoadId: 0, adminFilters: { q: '', category: '', status: '', sort: 'newest' }, page: 1, pagination: null, manageVideo: null, uploadFile: null, route: '', muted: readStore('lv-muted') !== '0' };
 const reportedViews = new Set();
 const streams = new WeakMap();
 const feedVideos = new WeakMap();
@@ -62,7 +62,7 @@ function shuffleSeed() {
   return Math.floor(Math.random() * 1000000) + 1;
 }
 
-const viewerPaths = ['/home', '/watch', '/search', '/profile'];
+const viewerPaths = ['/home', '/watch', '/images', '/search', '/profile'];
 const appPaths = ['/', '/login', '/admin', ...viewerPaths];
 
 function landingPath() { return state.user?.role === 'admin' ? '/admin' : '/home'; }
@@ -109,9 +109,9 @@ async function applyRoute() {
   if (path === '/login') return navigate(landingPath(), {}, { replace: true });
   if (state.user.role === 'admin' && viewerPaths.includes(path)) return navigate('/admin', {}, { replace: true });
   if (state.user.role !== 'admin' && path === '/admin') return navigate('/home', {}, { replace: true });
-  if (path === '/watch' && !params.get('seed')) {
+  if ((path === '/watch' || path === '/images') && !params.get('seed')) {
     params.set('seed', String(shuffleSeed()));
-    return navigate('/watch', Object.fromEntries(params), { replace: true });
+    return navigate(path, Object.fromEntries(params), { replace: true });
   }
   const signature = `${path}?${params}`;
   const sameRoute = signature === state.route;
@@ -120,26 +120,27 @@ async function applyRoute() {
   if (path === '/admin') { showTopSection('admin'); return showAdmin().catch(error => { $('#admin-status').textContent = error.message; }); }
   showTopSection('viewer'); updateViewerIdentity();
   if (path === '/home') return showViewerHome();
-  if (path === '/search') return showSearch(params.get('q') || '').catch(routeError);
+  if (path === '/search') return showSearch(params.get('q') || '', params.get('type') === 'image' ? 'image' : 'video').catch(routeError);
   if (path === '/profile') return showProfile();
   return showWatch({
+    mediaType: path === '/images' ? 'image' : 'video',
     category: params.get('category') || '', query: params.get('q') || '',
     seed: Number(params.get('seed')) || shuffleSeed(), startId: Number(params.get('v')) || 0, keepFeed: sameRoute
   }).catch(error => { $('#empty').textContent = error.message; $('#empty').hidden = false; });
 }
 
 function selectViewerTab(tab) {
-  for (const name of ['home', 'watch', 'search', 'profile']) {
+  for (const name of ['home', 'watch', 'images', 'search', 'profile']) {
     $(`#tab-${name}`).classList.toggle('active', name === tab);
   }
 }
 
 function showViewerSection(section) {
   $('#viewer-home-view').hidden = section !== 'home';
-  $('#feed').hidden = section !== 'watch';
+  $('#feed').hidden = !['watch', 'images'].includes(section);
   $('#search-view').hidden = section !== 'search';
   $('#profile-view').hidden = section !== 'profile';
-  if (section !== 'watch') { $('#empty').hidden = true; setPull(0); }
+  if (!['watch', 'images'].includes(section)) { $('#empty').hidden = true; setPull(0); }
   selectViewerTab(section);
 }
 
@@ -159,6 +160,7 @@ async function showViewerHome() {
 
 async function showAdmin() {
   state.page = 1;
+  updateAdminMediaUi();
   api('/api/settings')
     .then(({ feedMode }) => { $('#feed-mode').value = feedMode; })
     .catch(error => { $('#admin-status').textContent = `Setelan feed tidak terbaca: ${error.message}`; });
@@ -206,7 +208,7 @@ function playPlayer(player) {
   return player.play().catch(() => { player.muted = true; return player.play().catch(() => {}); });
 }
 
-function makeCard(video) {
+function makeVideoCard(video) {
   const card = document.createElement('article'); card.className = 'video-card';
   const player = document.createElement('video');
   player.loop = true; player.muted = state.muted; player.playsInline = true; player.preload = 'auto';
@@ -326,6 +328,67 @@ function makeCard(video) {
   return card;
 }
 
+function makeImageCard(item) {
+  const card = document.createElement('article'); card.className = 'video-card image-card';
+  const image = document.createElement('img');
+  image.className = 'feed-image'; image.src = item.src; image.alt = item.title; image.draggable = false;
+
+  const badge = document.createElement('span'); badge.className = 'tap-badge';
+  function flashLove() {
+    badge.className = 'tap-badge heart'; badge.replaceChildren(icon('heart'));
+    void badge.offsetWidth; badge.classList.add('show');
+  }
+  async function setLike(next) {
+    if (next === item.liked) return;
+    const result = await api(`/api/videos/${item.id}/like`, { method: next ? 'POST' : 'DELETE' });
+    item.liked = result.liked; item.likeCount = result.likeCount;
+    love.classList.toggle('liked', item.liked); count.textContent = item.likeCount || '';
+  }
+
+  let lastTap = 0;
+  image.addEventListener('click', () => {
+    const now = Date.now();
+    if (now - lastTap < 320) {
+      lastTap = 0; flashLove(); setLike(true).catch(() => {});
+    } else lastTap = now;
+  });
+
+  const meta = document.createElement('div'); meta.className = 'meta';
+  const category = document.createElement('span'); category.className = 'category'; category.textContent = (item.categories || [item.category]).join(' · ');
+  const title = document.createElement('h2'); title.textContent = item.title;
+  meta.append(category, title);
+  if (item.caption) { const caption = document.createElement('p'); caption.textContent = item.caption; meta.append(caption); }
+
+  const rail = document.createElement('div'); rail.className = 'player-rail';
+  const love = control('heart', 'Love', item.liked ? 'liked' : '');
+  const count = document.createElement('small'); count.textContent = item.likeCount || '';
+  const loveWrap = document.createElement('span'); loveWrap.className = 'love-wrap'; loveWrap.append(love, count);
+  love.addEventListener('click', event => { event.stopPropagation(); setLike(!item.liked).catch(() => {}); });
+  const crop = control('crop', 'Isi layar');
+  crop.addEventListener('click', event => {
+    event.stopPropagation();
+    const cropped = image.classList.toggle('crop'); crop.classList.toggle('active', cropped);
+  });
+  const fullscreen = control('fullscreen', 'Layar penuh');
+  fullscreen.addEventListener('click', event => {
+    event.stopPropagation();
+    if (document.fullscreenElement) document.exitFullscreen();
+    else card.requestFullscreen?.();
+  });
+  rail.append(loveWrap, crop, fullscreen);
+
+  playerActions.set(image, {
+    fullscreen: () => fullscreen.click(),
+    like: () => setLike(!item.liked).catch(() => {})
+  });
+  card.append(image, badge, meta, rail);
+  return card;
+}
+
+function makeCard(item) {
+  return item.mediaType === 'image' ? makeImageCard(item) : makeVideoCard(item);
+}
+
 // Reported once per feed session so the FYP ranking can push watched videos down later.
 function reportView(video) {
   if (reportedViews.has(video.id)) return;
@@ -334,26 +397,46 @@ function reportView(video) {
 }
 
 function playActiveCard() {
-  const player = activePlayer; if (!player || !state.feedReady) return;
-  ensureFeedStream(player); playPlayer(player);
+  const player = activePlayer;
+  if (!player || player.tagName !== 'VIDEO' || !state.feedReady) return;
+  ensureFeedStream(player);
+  playPlayer(player);
 }
 
 function observePlayback() {
-  playbackObserver?.disconnect(); bufferObserver?.disconnect();
+  playbackObserver?.disconnect();
+  bufferObserver?.disconnect();
   playbackObserver = new IntersectionObserver(entries => entries.forEach(entry => {
-    // Kartu yang naik ke layar penuh keluar dari scrollport feed; abaikan supaya
-    // videonya tidak ikut dijeda dan streamnya tidak dilepas.
     if (document.fullscreenElement) return;
-    const video = entry.target.querySelector('video');
-    if (entry.isIntersecting && entry.intersectionRatio > .75) { activePlayer = video; ensureFeedStream(video); if (state.feedReady) playPlayer(video); } else video.pause();
-    if (entry.isIntersecting && entry.intersectionRatio > .25 && Number(entry.target.dataset.feedIndex) >= state.videos.length - 2) loadMoreVideos().catch(() => {});
+    const player = entry.target.querySelector('video');
+    const image = entry.target.querySelector('.feed-image');
+    if (entry.isIntersecting && entry.intersectionRatio > .75) {
+      activePlayer = player || image;
+      if (player) {
+        ensureFeedStream(player);
+        if (state.feedReady) playPlayer(player);
+      } else {
+        const item = state.videos[Number(entry.target.dataset.feedIndex)];
+        if (item) reportView(item);
+      }
+    } else {
+      player?.pause();
+    }
+    if (entry.isIntersecting && entry.intersectionRatio > .25 && Number(entry.target.dataset.feedIndex) >= state.videos.length - 2) {
+      loadMoreVideos().catch(() => {});
+    }
   }), { root: $('#feed'), threshold: [.25, .75] });
+
   bufferObserver = new IntersectionObserver(entries => entries.forEach(entry => {
     if (document.fullscreenElement) return;
     const player = entry.target.querySelector('video');
+    if (!player) return;
     if (entry.isIntersecting) ensureFeedStream(player); else releaseFeedStream(player);
   }), { root: $('#feed'), rootMargin: '50% 0px 75% 0px', threshold: 0 });
-  document.querySelectorAll('.video-card').forEach(card => { playbackObserver.observe(card); bufferObserver.observe(card); });
+  document.querySelectorAll('.video-card').forEach(card => {
+    playbackObserver.observe(card);
+    if (card.querySelector('video')) bufferObserver.observe(card);
+  });
 }
 
 async function loadVideos(reset = false) {
@@ -365,6 +448,7 @@ async function loadVideos(reset = false) {
   const loadId = reset ? ++state.viewerLoadId : state.viewerLoadId;
   const page = reset || relap ? 1 : state.viewerPage + 1;
   const query = new URLSearchParams({ page, limit: 5, age: Math.max(0, Date.now() - (state.viewerSince || Date.now())) });
+  query.set('type', state.viewerMediaType);
   if (state.viewerCategory) query.set('category', state.viewerCategory);
   if (state.viewerQuery) query.set('q', state.viewerQuery);
   if (state.viewerSeed) query.set('seed', state.viewerSeed);
@@ -372,7 +456,9 @@ async function loadVideos(reset = false) {
   try {
     const [{ videos, pagination }, startVideo] = await Promise.all([
       api(`/api/videos?${query}`),
-      reset && state.viewerStartId ? api(`/api/videos/${state.viewerStartId}`).then(body => body.video).catch(() => null) : null
+      reset && state.viewerStartId
+        ? api(`/api/videos/${state.viewerStartId}`).then(body => body.video.mediaType === state.viewerMediaType ? body.video : null).catch(() => null)
+        : null
     ]);
     if (loadId !== state.viewerLoadId) return;
     state.viewerPage = pagination.page; state.viewerPagination = pagination;
@@ -397,15 +483,31 @@ function renderFeed(videos, append = false) {
   const offset = append ? state.videos.length - videos.length : 0;
   const cards = videos.map((video, index) => { const card = makeCard(video); card.dataset.feedIndex = offset + index; return card; });
   if (append) $('#feed').append(...cards); else { releaseFeed(); $('#feed').replaceChildren(...cards); $('#feed').scrollTop = 0; }
-  $('#empty').textContent = state.viewerCategory ? 'Belum ada video di kategori ini.' : 'Belum ada video.';
+  $('#empty').textContent = state.viewerCategory
+    ? `Belum ada ${state.viewerMediaType === 'image' ? 'gambar' : 'video'} di kategori ini.`
+    : `Belum ada ${state.viewerMediaType === 'image' ? 'gambar' : 'video'}.`;
   $('#empty').hidden = state.videos.length > 0; observePlayback();
 }
 
-async function showWatch({ category = '', query = '', seed = 0, startId = 0, keepFeed = false } = {}) {
-  showViewerSection('watch');
+async function showWatch({ category = '', query = '', seed = 0, startId = 0, keepFeed = false, mediaType = 'video' } = {}) {
+  const isImage = mediaType === 'image';
+  showViewerSection(mediaType === 'image' ? 'images' : 'watch');
+  state.viewerMediaType = mediaType;
+  $('#feed').setAttribute('aria-label', isImage ? 'Feed gambar' : 'Feed video');
+  $('#feed-intro-title').textContent = isImage ? 'Siap melihat gambar?' : 'Siap menonton?';
+  $('#feed-intro-start').textContent = isImage ? 'Lihat gambar' : 'Mulai menonton';
+  const tips = $('#feed-intro').querySelectorAll('.feed-intro-list li');
+  const setTip = (index, title, description) => {
+    const strong = document.createElement('strong'); strong.textContent = title;
+    tips[index].lastElementChild.replaceChildren(strong, description);
+  };
+  setTip(0, 'Geser atas & bawah', 'Pindah ke ' + (isImage ? 'gambar' : 'video') + ' berikutnya atau sebelumnya.');
+  setTip(1, isImage ? 'Ketuk dua kali' : 'Ketuk video', isImage ? 'Berikan love pada gambar.' : 'Putar atau jeda video.');
+  tips[2].hidden = isImage;
+  setTip(3, 'Tarik ke bawah', 'Di ' + (isImage ? 'gambar' : 'video') + ' teratas untuk mengacak ulang feed.');
   showIntro();
   if (keepFeed && state.videos.length) { observePlayback(); return; }
-  state.viewerCategory = category; state.viewerQuery = query; state.viewerSeed = seed; state.viewerStartId = startId;
+  state.viewerMediaType = mediaType; state.viewerCategory = category; state.viewerQuery = query; state.viewerSeed = seed; state.viewerStartId = startId;
   state.viewerSince = Date.now(); reportedViews.clear();
   await loadVideos(true);
 }
@@ -421,7 +523,7 @@ function showIntro() {
   const overlay = $('#feed-intro');
   clearTimeout(state.feedIntroTimer);
   state.feedReady = false;
-  const seen = readFlag('lv-intro-seen');
+  const seen = readFlag('lv-intro-seen-' + state.viewerMediaType);
   $('#feed-intro-hint').hidden = !seen;
   overlay.classList.remove('visible', 'counting');
   overlay.style.setProperty('--intro-delay', `${introDelay}ms`);
@@ -439,7 +541,7 @@ function dismissIntro() {
   const overlay = $('#feed-intro');
   clearTimeout(state.feedIntroTimer);
   if (overlay.hidden || state.feedReady) return;
-  writeFlag('lv-intro-seen');
+  writeFlag('lv-intro-seen-' + state.viewerMediaType);
   overlay.classList.remove('visible', 'counting');
   setTimeout(() => { if (!overlay.classList.contains('visible')) overlay.hidden = true; }, 320);
   state.feedReady = true;
@@ -470,7 +572,7 @@ async function reshuffleWatch() {
   state.viewerSeed = shuffleSeed(); state.viewerStartId = 0; state.viewerSince = Date.now(); reportedViews.clear();
   const params = new URLSearchParams(location.search);
   params.set('seed', String(state.viewerSeed)); params.delete('v');
-  const target = `/watch?${params}`;
+  const target = `${location.pathname}?${params}`;
   history.replaceState(null, '', target); state.route = target;
   try { await loadVideos(true); }
   catch (error) { $('#empty').textContent = error.message; $('#empty').hidden = false; }
@@ -492,13 +594,14 @@ function categoryCard(category, index = 0) {
   else card.append(cardFallback());
   const overlay = document.createElement('span'); overlay.className = 'category-overlay';
   const name = document.createElement('strong'); name.textContent = category.name;
-  const count = document.createElement('small'); count.textContent = `${category.videoCount} video`;
-  overlay.append(name, count); card.append(overlay); card.addEventListener('click', () => navigate('/watch', { category: category.name })); return card;
+  const count = document.createElement('small'); count.textContent = `${category.mediaCount ?? category.videoCount} ${state.searchMediaType === 'image' ? 'gambar' : 'video'}`;
+  overlay.append(name, count); card.append(overlay); card.addEventListener('click', () => navigate(state.searchMediaType === 'image' ? '/images' : '/watch', { category: category.name })); return card;
 }
 
 function homeVideoCard(video, index = 0) {
   const card = document.createElement('button'); card.type = 'button'; card.className = 'home-video-card'; card.style.setProperty('--i', index);
   const visual = document.createElement('span'); visual.className = 'home-video-visual';
+  visual.classList.toggle('is-image', video.mediaType === 'image');
   if (video.thumbnail) {
     const image = document.createElement('img'); image.src = video.thumbnail; image.alt = ''; visual.append(image);
   } else {
@@ -506,24 +609,41 @@ function homeVideoCard(video, index = 0) {
   }
   const details = document.createElement('span'); details.className = 'home-video-details';
   const title = document.createElement('strong'); title.textContent = video.title;
-  const meta = document.createElement('small'); meta.textContent = `${(video.categories || [video.category]).join(' · ')} · ${formatTime(video.durationSeconds)}`;
-  details.append(title, meta); card.append(visual, details); card.addEventListener('click', () => navigate('/watch', { v: video.id })); return card;
+  const mediaDetail = video.mediaType === 'image'
+    ? (video.width && video.height ? `${video.width}×${video.height}` : 'Gambar')
+    : formatTime(video.durationSeconds);
+  const meta = document.createElement('small'); meta.textContent = `${(video.categories || [video.category]).join(' · ')} · ${mediaDetail}`;
+  details.append(title, meta); card.append(visual, details);
+  card.addEventListener('click', () => navigate(video.mediaType === 'image' ? '/images' : '/watch', { v: video.id }));
+  return card;
 }
 
 async function loadHomeVideos() {
-  const loadId = ++state.homeLoadId; const empty = $('#home-video-empty');
-  empty.textContent = 'Memuat koleksi…'; empty.hidden = false;
+  const loadId = ++state.homeLoadId;
+  const videoEmpty = $('#home-video-empty');
+  const imageEmpty = $('#home-image-empty');
+  videoEmpty.textContent = 'Memuat video…'; imageEmpty.textContent = 'Memuat gambar…';
+  videoEmpty.hidden = false; imageEmpty.hidden = false;
   try {
-    const { videos, pagination } = await api('/api/videos?page=1&limit=6');
+    const [videoResult, imageResult] = await Promise.all([
+      api('/api/videos?page=1&limit=6&type=video'),
+      api('/api/videos?page=1&limit=6&type=image')
+    ]);
     if (loadId !== state.homeLoadId) return;
-    state.homeVideos = videos; state.homePagination = pagination;
-    $('#home-video-grid').replaceChildren(...videos.map(homeVideoCard));
-    empty.textContent = 'Belum ada video di koleksi.';
-    empty.hidden = videos.length > 0;
+    state.homeVideos = videoResult.videos;
+    $('#home-video-grid').replaceChildren(...videoResult.videos.map(homeVideoCard));
+    $('#home-image-grid').replaceChildren(...imageResult.videos.map(homeVideoCard));
+    videoEmpty.textContent = 'Belum ada video di koleksi.';
+    imageEmpty.textContent = 'Belum ada gambar di koleksi.';
+    videoEmpty.hidden = videoResult.videos.length > 0;
+    imageEmpty.hidden = imageResult.videos.length > 0;
   } catch (error) {
     if (loadId !== state.homeLoadId) return;
-    state.homeVideos = []; state.homePagination = null; $('#home-video-grid').replaceChildren();
-    empty.textContent = error.message; empty.hidden = false;
+    state.homeVideos = [];
+    $('#home-video-grid').replaceChildren();
+    $('#home-image-grid').replaceChildren();
+    videoEmpty.textContent = error.message; imageEmpty.textContent = error.message;
+    videoEmpty.hidden = false; imageEmpty.hidden = false;
   }
 }
 
@@ -534,13 +654,17 @@ function searchVideoCard(video, index = 0) {
   const overlay = document.createElement('span'); overlay.className = 'category-overlay';
   const title = document.createElement('strong'); title.textContent = video.title;
   const category = document.createElement('small'); category.textContent = (video.categories || [video.category]).join(' · ');
-  overlay.append(title, category); card.append(overlay); card.addEventListener('click', () => navigate('/watch', { v: video.id, q: state.searchQuery })); return card;
+  overlay.append(title, category); card.append(overlay); card.addEventListener('click', () => navigate(video.mediaType === 'image' ? '/images' : '/watch', { v: video.id, q: state.searchQuery })); return card;
 }
 
-async function showSearch(query = '') {
+async function showSearch(query = '', mediaType = 'video') {
   releaseFeed(); hideIntro();
   showViewerSection('search');
   if ($('#viewer-search').value !== query) $('#viewer-search').value = query;
+  state.searchMediaType = mediaType;
+  $('#viewer-search').placeholder = mediaType === 'image' ? 'Cari gambar…' : 'Cari video…';
+  $('#search-type-video').classList.toggle('active', mediaType === 'video');
+  $('#search-type-image').classList.toggle('active', mediaType === 'image');
   state.searchQuery = query;
   if (query) await loadSearchVideos(true); else await loadSearchCategories();
   if (document.activeElement !== $('#viewer-search')) requestAnimationFrame(() => $('#viewer-search').focus({ preventScroll: true }));
@@ -549,7 +673,7 @@ async function showSearch(query = '') {
 async function loadSearchCategories() {
   const loadId = ++state.searchLoadId; state.searchLoading = true; $('#viewer-search-empty').hidden = true;
   try {
-    const { categories } = await api('/api/categories'); if (loadId !== state.searchLoadId || state.searchQuery) return;
+    const { categories } = await api(`/api/categories?type=${state.searchMediaType}`); if (loadId !== state.searchLoadId || state.searchQuery) return;
     $('#search-grid').replaceChildren(...categories.map(categoryCard));
     $('#viewer-search-empty').textContent = 'Belum ada kategori.'; $('#viewer-search-empty').hidden = categories.length > 0;
   } finally { if (loadId === state.searchLoadId) state.searchLoading = false; }
@@ -560,6 +684,7 @@ async function loadSearchVideos(reset = false) {
   if (!reset && state.searchPagination && state.searchPage >= state.searchPagination.totalPages) return;
   const queryValue = state.searchQuery; const loadId = reset ? ++state.searchLoadId : state.searchLoadId;
   const page = reset ? 1 : state.searchPage + 1; const query = new URLSearchParams({ page, limit: 5, q: queryValue });
+  query.set('type', state.searchMediaType);
   state.searchLoading = true;
   try {
     const { videos, pagination } = await api(`/api/videos?${query}`);
@@ -567,7 +692,7 @@ async function loadSearchVideos(reset = false) {
     state.searchPage = pagination.page; state.searchPagination = pagination;
     if (reset) { state.searchVideos = videos; $('#search-grid').replaceChildren(...videos.map(searchVideoCard)); $('#search-view').scrollTop = 0; }
     else { state.searchVideos.push(...videos); $('#search-grid').append(...videos.map(searchVideoCard)); }
-    $('#viewer-search-empty').textContent = 'Tidak ada video yang cocok.'; $('#viewer-search-empty').hidden = state.searchVideos.length > 0;
+    $('#viewer-search-empty').textContent = `Tidak ada ${state.searchMediaType === 'image' ? 'gambar' : 'video'} yang cocok.`; $('#viewer-search-empty').hidden = state.searchVideos.length > 0;
   } finally { if (loadId === state.searchLoadId) state.searchLoading = false; }
 }
 
@@ -575,9 +700,46 @@ function showProfile() {
   releaseFeed(); hideIntro(); showViewerSection('profile');
 }
 
+function updateAdminMediaUi() {
+  const isImage = state.adminMediaType === 'image';
+  $('#admin-type-video').classList.toggle('active', !isImage);
+  $('#admin-type-image').classList.toggle('active', isImage);
+  $('#admin-media-title').firstChild.textContent = isImage ? 'Gambar ' : 'Video ';
+  $('#sync-videos').textContent = isImage ? 'Sync gambar' : 'Sync video';
+  $('#admin-search').placeholder = isImage ? 'Cari gambar…' : 'Cari video…';
+  $('#admin-empty').textContent = isImage ? 'Tidak ada gambar yang cocok.' : 'Tidak ada video yang cocok.';
+  $('#upload-dialog-title').textContent = isImage ? 'Tambah gambar' : 'Tambah video';
+  $('#drop-title').textContent = isImage ? 'Tarik gambar ke sini' : 'Tarik video ke sini';
+  $('#upload-submit').textContent = isImage ? 'Unggah gambar' : 'Unggah video';
+  $('#video-title').placeholder = isImage ? 'Judul gambar' : 'Judul video';
+  $('#video-caption').placeholder = isImage ? 'Keterangan gambar' : 'Keterangan video';
+  $('#video-url').placeholder = isImage ? 'https://…/gambar.jpg' : 'https://…/video.mp4';
+  $('#url-title').placeholder = isImage ? 'Judul gambar' : 'Judul video';
+  $('#upload-hint').textContent = isImage
+    ? 'JPG, PNG, atau WebP maksimum 25 MB. Otomatis dioptimasi hingga 500 KB.'
+    : 'MP4, WebM, MOV, atau TS maksimum 500 MB.';
+  $('#video-file').accept = isImage
+    ? 'image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp'
+    : 'video/mp4,video/webm,video/quicktime,video/mp2t,.ts';
+}
+
+async function switchAdminMediaType(mediaType) {
+  if (mediaType === state.adminMediaType) return;
+  clearTimeout(state.adminTimer);
+  state.adminMediaType = mediaType;
+  state.page = 1;
+  state.manageVideo = null;
+  state.adminFilters.category = '';
+  $('#admin-category').value = '';
+  setUploadFile(null);
+  updateAdminMediaUi();
+  await loadAdminVideos();
+}
+
 async function loadAdminVideos() {
   const loadId = ++state.adminLoadId;
   const query = new URLSearchParams({ page: state.page, limit: 10, sort: state.adminFilters.sort });
+  query.set('type', state.adminMediaType);
   if (state.adminFilters.q) query.set('q', state.adminFilters.q);
   if (state.adminFilters.category) query.set('category', state.adminFilters.category);
   if (state.adminFilters.status) query.set('status', state.adminFilters.status);
@@ -588,39 +750,69 @@ async function loadAdminVideos() {
   categorySelect.replaceChildren(new Option('Semua kategori', ''), ...(facets?.categories || []).map(category => new Option(category, category)));
   categorySelect.value = selectedCategory;
   clearTimeout(state.adminTimer);
-  if (!$('#admin').hidden && videos.some(video => video.ingestStatus === 'downloading' || video.conversionStatus === 'converting' || (video.ingestStatus === 'ready' && video.sourceType === 'upload' && !video.durationSeconds && !video.originalDeleted))) {
+  if (!$('#admin').hidden && videos.some(video => video.ingestStatus === 'downloading' || video.conversionStatus === 'converting' || video.optimizationStatus === 'optimizing' || (video.mediaType === 'video' && video.ingestStatus === 'ready' && video.sourceType === 'upload' && !video.durationSeconds && !video.originalDeleted))) {
     state.adminTimer = setTimeout(loadAdminVideos, 1800);
   }
 }
 
 function openPreview(video) {
   $('#preview-title').textContent = video.title;
-  attachStream($('#preview-video'), video);
+  const player = $('#preview-video');
+  const image = $('#preview-image');
+  if (video.mediaType === 'image') {
+    streams.get(player)?.destroy();
+    player.pause(); player.removeAttribute('src'); player.load(); player.hidden = true;
+    image.src = video.src; image.alt = video.title; image.hidden = false;
+  } else {
+    image.hidden = true; image.removeAttribute('src');
+    player.hidden = false; attachStream(player, video);
+  }
   $('#preview-dialog').showModal();
 }
 
 function openMetadata(video) {
   state.manageVideo = video;
+  const isImage = video.mediaType === 'image';
+  $('#metadata-dialog-title').textContent = isImage ? 'Kelola gambar' : 'Kelola video';
+  $('#metadata-title').placeholder = isImage ? 'Judul gambar' : 'Judul video';
+  $('#metadata-thumbnail-row').hidden = isImage;
   const form = $('#metadata-form'); form.dataset.videoId = video.id;
-  $('#metadata-title').value = video.title; $('#metadata-category').value = (video.categories || [video.category]).join(', '); $('#metadata-caption').value = video.caption || '';
-  $('#metadata-thumbnail').value = ''; $('#metadata-status').textContent = '';
-  if (video.thumbnail) { $('#metadata-preview').src = video.thumbnail; $('#metadata-preview').hidden = false; }
-  else { $('#metadata-preview').removeAttribute('src'); $('#metadata-preview').hidden = true; }
+  $('#metadata-title').value = video.title;
+  $('#metadata-category').value = (video.categories || [video.category]).join(', ');
+  $('#metadata-caption').value = video.caption || '';
+  $('#metadata-thumbnail').value = '';
+  $('#metadata-status').textContent = '';
+  const previewSource = video.thumbnail || (isImage ? video.src : null);
+  if (previewSource) {
+    $('#metadata-preview').src = previewSource;
+    $('#metadata-preview').hidden = false;
+  } else {
+    $('#metadata-preview').removeAttribute('src');
+    $('#metadata-preview').hidden = true;
+  }
+
   const frameVideo = $('#frame-video');
-  $('#frame-picker').hidden = video.sourceType !== 'upload' || video.ingestStatus !== 'ready';
-  if (video.sourceType === 'upload' && video.ingestStatus === 'ready') {
+  $('#frame-picker').hidden = isImage || video.sourceType !== 'upload' || video.ingestStatus !== 'ready';
+  if (!isImage && video.sourceType === 'upload' && video.ingestStatus === 'ready') {
     attachStream(frameVideo, video);
     const initialTime = Math.min(5, Math.max(0, Number(video.durationSeconds || 0) * .15));
     $('#frame-time').max = String(video.durationSeconds || 0);
     $('#frame-time').value = String(initialTime);
     $('#frame-clock').textContent = formatTime(initialTime);
-    frameVideo.onloadedmetadata = () => { $('#frame-time').max = String(frameVideo.duration || video.durationSeconds || 0); frameVideo.currentTime = initialTime; };
+    frameVideo.onloadedmetadata = () => {
+      $('#frame-time').max = String(frameVideo.duration || video.durationSeconds || 0);
+      frameVideo.currentTime = initialTime;
+    };
   }
-  const canConvert = video.ingestStatus === 'ready' && video.sourceType === 'upload' && !video.originalDeleted && !video.nativeTs && video.conversionStatus !== 'converted';
+
+  const canConvert = !isImage && video.ingestStatus === 'ready' && video.sourceType === 'upload' && !video.originalDeleted && !video.nativeTs && video.conversionStatus !== 'converted';
   $('#manage-convert').hidden = !canConvert;
   $('#manage-convert').disabled = video.conversionStatus === 'converting';
   $('#manage-convert').textContent = video.conversionStatus === 'converting' ? `Konversi ${video.conversionProgress}%` : 'Konversi TS';
-  $('#manage-original').hidden = video.sourceType !== 'upload' || video.nativeTs || video.originalDeleted || video.conversionStatus !== 'converted';
+  $('#manage-optimize').hidden = !isImage;
+  $('#manage-optimize').disabled = video.optimizationStatus === 'optimizing' || video.ingestStatus !== 'ready';
+  $('#manage-optimize').textContent = video.optimizationStatus === 'optimizing' ? 'Mengoptimasi…' : (video.optimizationStatus === 'optimised' ? 'Optimasi ulang' : 'Optimasi gambar');
+  $('#manage-original').hidden = isImage || video.sourceType !== 'upload' || video.nativeTs || video.originalDeleted || video.conversionStatus !== 'converted';
   $('#manage-preview').disabled = video.ingestStatus !== 'ready';
   $('#metadata-dialog').showModal();
 }
@@ -651,26 +843,51 @@ function adminRow(video) {
 // membangun ulang seluruh baris bikin daftarnya berkedip.
 function fillAdminRow(refs, video) {
   refs.video = video;
-  const working = video.ingestStatus === 'downloading' || video.conversionStatus === 'converting';
-  const text = video.ingestStatus === 'downloading' ? `Download ${video.ingestProgress ? `${video.ingestProgress}%` : '…'}`
-    : video.ingestStatus === 'failed' ? 'Download gagal'
-      : video.conversionStatus === 'converting' ? `Konversi ${video.conversionProgress}%`
-        : video.conversionStatus === 'failed' ? 'Konversi gagal'
-          : video.conversionStatus === 'converted' ? ''
-            : video.nativeTs ? 'Membaca TS' : 'unoptimised';
-  const className = `status status-${video.ingestStatus !== 'ready' ? video.ingestStatus : video.conversionStatus}`;
-  const detail = `${(video.categories || [video.category]).join(', ')} · ${formatTime(video.durationSeconds)} · ${formatBytes(video.sizeBytes)}`;
-  const progress = video.ingestStatus === 'downloading' ? video.ingestProgress : video.conversionProgress;
+  const isImage = video.mediaType === 'image';
+  const working = video.ingestStatus === 'downloading'
+    || (!isImage && video.conversionStatus === 'converting')
+    || (isImage && video.optimizationStatus === 'optimizing');
+  let text = '';
+  let statusKey = '';
+  let progress = 0;
+
+  if (video.ingestStatus === 'downloading') {
+    text = `Download ${video.ingestProgress ? `${video.ingestProgress}%` : '…'}`;
+    statusKey = 'downloading'; progress = video.ingestProgress;
+  } else if (video.ingestStatus === 'failed') {
+    text = 'Download gagal'; statusKey = 'failed';
+  } else if (isImage) {
+    statusKey = video.optimizationStatus;
+    if (video.optimizationStatus === 'optimizing') text = 'Mengoptimasi…';
+    else if (video.optimizationStatus === 'failed') text = 'Optimasi gagal';
+    else if (video.optimizationStatus !== 'optimised') text = 'Belum dioptimasi';
+  } else {
+    statusKey = video.conversionStatus;
+    if (video.conversionStatus === 'converting') {
+      text = `Konversi ${video.conversionProgress}%`; progress = video.conversionProgress;
+    } else if (video.conversionStatus === 'failed') text = 'Konversi gagal';
+    else if (video.conversionStatus !== 'converted') text = video.nativeTs ? 'Membaca TS' : 'Belum dioptimasi';
+  }
+
+  const categoryText = (video.categories || [video.category]).join(', ');
+  const mediaDetail = isImage
+    ? `${video.width && video.height ? `${video.width}×${video.height}` : 'Dimensi dibaca'} · ${formatBytes(video.sizeBytes)}${video.originalSizeBytes && video.originalSizeBytes !== video.sizeBytes ? ` (asal ${formatBytes(video.originalSizeBytes)})` : ''}`
+    : `${formatTime(video.durationSeconds)} · ${formatBytes(video.sizeBytes)}`;
+  const detail = `${isImage ? 'Gambar' : 'Video'} · ${categoryText} · ${mediaDetail}`;
+  const className = `status status-${statusKey || 'none'}`;
+
   if (refs.name.textContent !== video.title) refs.name.textContent = video.title;
   if (refs.details.textContent !== detail) refs.details.textContent = detail;
   if (refs.status.textContent !== text) refs.status.textContent = text;
   if (refs.status.className !== className) refs.status.className = className;
   refs.status.hidden = !text;
-  refs.status.title = video.ingestError || video.conversionError || '';
+  refs.status.title = video.ingestError || (isImage ? video.optimizationError : video.conversionError) || '';
   if (refs.image.getAttribute('src') !== video.thumbnail) {
     if (video.thumbnail) refs.image.src = video.thumbnail; else refs.image.removeAttribute('src');
   }
-  refs.image.hidden = !video.thumbnail; refs.fallback.hidden = Boolean(video.thumbnail);
+  refs.image.hidden = !video.thumbnail;
+  refs.fallback.hidden = Boolean(video.thumbnail);
+  refs.fallback.textContent = isImage ? 'IMG' : 'LV';
   refs.thumb.classList.toggle('working', working);
   refs.thumb.style.setProperty('--progress', `${Number(progress) || 0}%`);
 }
@@ -710,20 +927,26 @@ async function logout() { await api('/api/logout', { method: 'POST' }); state.us
 const routeError = error => { $('#viewer-search-empty').textContent = error.message; $('#viewer-search-empty').hidden = false; };
 $('#profile-logout').addEventListener('click', logout); $('#admin-logout').addEventListener('click', logout);
 $('#admin-home').addEventListener('click', () => navigate('/'));
+$('#admin-type-video').addEventListener('click', () => switchAdminMediaType('video').catch(error => { $('#admin-status').textContent = error.message; }));
+$('#admin-type-image').addEventListener('click', () => switchAdminMediaType('image').catch(error => { $('#admin-status').textContent = error.message; }));
 $('#home-enter').addEventListener('click', () => navigate(landingPath())); $('#home-primary').addEventListener('click', () => navigate(landingPath()));
 $('#tab-home').addEventListener('click', () => navigate('/home'));
 $('#home-watch').addEventListener('click', () => navigate('/watch'));
 $('#home-see-all').addEventListener('click', () => navigate('/watch'));
+$('#home-see-images').addEventListener('click', () => navigate('/images'));
 $('#tab-watch').addEventListener('click', () => navigate('/watch'));
-$('#tab-search').addEventListener('click', () => navigate('/search', { q: state.searchQuery }).catch(routeError));
+$('#tab-images').addEventListener('click', () => navigate('/images'));
+$('#tab-search').addEventListener('click', () => navigate('/search', { q: state.searchQuery, type: state.searchMediaType }).catch(routeError));
 $('#tab-profile').addEventListener('click', () => navigate('/profile'));
+$('#search-type-video').addEventListener('click', () => navigate('/search', { q: state.searchQuery, type: 'video' }, { replace: true }).catch(routeError));
+$('#search-type-image').addEventListener('click', () => navigate('/search', { q: state.searchQuery, type: 'image' }, { replace: true }).catch(routeError));
 $('#viewer-search-form').addEventListener('submit', event => {
   event.preventDefault(); clearTimeout(state.searchTimer);
-  navigate('/search', { q: $('#viewer-search').value.trim() }, { replace: true }).catch(routeError);
+  navigate('/search', { q: $('#viewer-search').value.trim(), type: state.searchMediaType }, { replace: true }).catch(routeError);
 });
 $('#viewer-search').addEventListener('input', () => {
   clearTimeout(state.searchTimer);
-  state.searchTimer = setTimeout(() => navigate('/search', { q: $('#viewer-search').value.trim() }, { replace: true }).catch(routeError), 260);
+  state.searchTimer = setTimeout(() => navigate('/search', { q: $('#viewer-search').value.trim(), type: state.searchMediaType }, { replace: true }).catch(routeError), 260);
 });
 $('#search-view').addEventListener('scroll', () => { if (state.searchQuery && $('#search-view').scrollTop + $('#search-view').clientHeight >= $('#search-view').scrollHeight - 320) loadSearchVideos().catch(() => {}); });
 $('#feed-intro').addEventListener('click', dismissIntro);
@@ -774,7 +997,13 @@ for (const eventName of ['touchend', 'touchcancel']) $('#feed').addEventListener
   if (feedTouchPull >= pullThreshold) reshuffleWatch().catch(() => {}); else setPull(0);
   feedTouchStart = null; feedTouchPull = 0;
 }, { passive: true });
-$('#preview-dialog').addEventListener('close', () => { const player = $('#preview-video'); streams.get(player)?.destroy(); player.pause(); player.removeAttribute('src'); player.load(); });
+$('#preview-dialog').addEventListener('close', () => {
+  const player = $('#preview-video');
+  const image = $('#preview-image');
+  streams.get(player)?.destroy();
+  player.pause(); player.removeAttribute('src'); player.load();
+  image.removeAttribute('src'); image.hidden = true;
+});
 $('#metadata-dialog').addEventListener('close', () => { const player = $('#frame-video'); streams.get(player)?.destroy(); player.pause(); player.removeAttribute('src'); player.load(); });
 function selectAddTab(tab) {
   const upload = tab === 'upload';
@@ -783,13 +1012,34 @@ function selectAddTab(tab) {
 $('#upload-open').addEventListener('click', () => { selectAddTab('upload'); $('#upload-dialog').showModal(); });
 $('#upload-tab').addEventListener('click', () => selectAddTab('upload'));
 $('#url-tab').addEventListener('click', () => selectAddTab('url'));
-function setUploadFile(file) { state.uploadFile = file || null; $('#drop-file').textContent = file ? `${file.name} · ${formatBytes(file.size)}` : 'atau klik untuk memilih'; $('#dropzone').classList.toggle('has-file', Boolean(file)); }
+function uploadFileMatchesType(file) {
+  if (!file) return false;
+  return state.adminMediaType === 'image'
+    ? /\.(jpe?g|png|webp)$/i.test(file.name)
+    : /\.(mp4|webm|mov|ts)$/i.test(file.name);
+}
+function setUploadFile(file) {
+  if (file && !uploadFileMatchesType(file)) {
+    state.uploadFile = null;
+    $('#drop-file').textContent = 'atau klik untuk memilih';
+    $('#dropzone').classList.remove('has-file');
+    $('#upload-status').textContent = state.adminMediaType === 'image'
+      ? 'Gunakan JPG, PNG, atau WebP.'
+      : 'Gunakan MP4, WebM, MOV, atau TS.';
+    return false;
+  }
+  state.uploadFile = file || null;
+  $('#drop-file').textContent = file ? `${file.name} · ${formatBytes(file.size)}` : 'atau klik untuk memilih';
+  $('#dropzone').classList.toggle('has-file', Boolean(file));
+  if (file) $('#upload-status').textContent = '';
+  return true;
+}
 $('#dropzone').addEventListener('click', () => $('#video-file').click());
 $('#dropzone').addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); $('#video-file').click(); } });
 $('#video-file').addEventListener('change', () => setUploadFile($('#video-file').files[0]));
 for (const eventName of ['dragenter', 'dragover']) $('#dropzone').addEventListener(eventName, event => { event.preventDefault(); $('#dropzone').classList.add('dragging'); });
 for (const eventName of ['dragleave', 'drop']) $('#dropzone').addEventListener(eventName, event => { event.preventDefault(); $('#dropzone').classList.remove('dragging'); });
-$('#dropzone').addEventListener('drop', event => { const file = [...event.dataTransfer.files].find(item => /\.(mp4|webm|mov|ts)$/i.test(item.name)); if (file) setUploadFile(file); else $('#upload-status').textContent = 'Gunakan MP4, WebM, MOV, atau TS.'; });
+$('#dropzone').addEventListener('drop', event => { const file = [...event.dataTransfer.files][0]; setUploadFile(file); });
 async function applyAdminTools() {
   clearTimeout(state.adminSearchTimer); clearTimeout(state.adminTimer);
   state.adminFilters.q = $('#admin-search').value.trim(); state.adminFilters.category = $('#admin-category').value;
@@ -812,32 +1062,67 @@ $('#feed-mode').addEventListener('change', async () => {
 $('#sync-videos').addEventListener('click', async () => {
   const status = $('#admin-status');
   try {
-    const result = await api('/api/videos/sync', { method: 'POST' });
+    const result = await api(`/api/videos/sync?type=${state.adminMediaType}`, { method: 'POST' });
     status.textContent = `Sync: ${result.added} baru, ${result.existing} sudah ada, ${result.skipped} dilewati.`;
     state.page = 1; await loadAdminVideos();
   } catch (error) { status.textContent = error.message; }
 });
 $('#upload-form').addEventListener('submit', event => {
   event.preventDefault();
-  const file = state.uploadFile || $('#video-file').files[0]; if (!file) { $('#upload-status').textContent = 'Pilih atau tarik video terlebih dahulu.'; return; }
-  const status = $('#upload-status'); const progress = $('#upload-progress');
-  const query = new URLSearchParams({ title: $('#video-title').value || file.name.replace(/\.[^.]+$/, ''), category: $('#video-category').value || 'Umum', caption: $('#video-caption').value });
-  const request = new XMLHttpRequest(); request.open('POST', `/api/videos/upload?${query}`);
-  const uploadType = file.type || (file.name.toLowerCase().endsWith('.ts') ? 'video/mp2t' : 'video/mp4');
-  request.setRequestHeader('Content-Type', uploadType);
-  progress.hidden = false; status.textContent = 'Mengunggah 0%';
-  request.upload.onprogress = event => { if (event.lengthComputable) { const percent = Math.round(event.loaded / event.total * 100); progress.value = percent; status.textContent = `Mengunggah ${percent}%`; } };
+  const mediaType = state.adminMediaType;
+  const file = state.uploadFile || $('#video-file').files[0];
+  if (!file || !uploadFileMatchesType(file)) {
+    $('#upload-status').textContent = `Pilih atau tarik ${mediaType === 'image' ? 'gambar' : 'video'} terlebih dahulu.`;
+    return;
+  }
+
+  const status = $('#upload-status');
+  const progress = $('#upload-progress');
+  const query = new URLSearchParams({
+    title: $('#video-title').value || file.name.replace(/\.[^.]+$/, ''),
+    category: $('#video-category').value || 'Umum',
+    caption: $('#video-caption').value
+  });
+  const extension = file.name.split('.').pop().toLowerCase();
+  const fallbackTypes = {
+    ts: 'video/mp2t', mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp'
+  };
+  const request = new XMLHttpRequest();
+  request.open('POST', `/api/videos/upload?${query}`);
+  request.setRequestHeader('Content-Type', file.type || fallbackTypes[extension]);
+  progress.hidden = false;
+  status.textContent = 'Mengunggah 0%';
+  request.upload.onprogress = uploadEvent => {
+    if (!uploadEvent.lengthComputable) return;
+    const percent = Math.round(uploadEvent.loaded / uploadEvent.total * 100);
+    progress.value = percent;
+    status.textContent = `Mengunggah ${percent}%`;
+  };
   request.onload = async () => {
     progress.hidden = true;
-    if (request.status >= 200 && request.status < 300) { event.target.reset(); setUploadFile(null); status.textContent = ''; $('#upload-dialog').close(); $('#admin-status').textContent = 'Video ditambahkan.'; state.page = 1; await loadAdminVideos(); }
-    else { try { status.textContent = JSON.parse(request.responseText).error; } catch { status.textContent = 'Upload gagal.'; } }
+    if (request.status >= 200 && request.status < 300) {
+      event.target.reset(); setUploadFile(null); status.textContent = '';
+      $('#upload-dialog').close();
+      $('#admin-status').textContent = `${mediaType === 'image' ? 'Gambar' : 'Video'} ditambahkan.`;
+      state.page = 1;
+      await loadAdminVideos();
+    } else {
+      try { status.textContent = JSON.parse(request.responseText).error; }
+      catch { status.textContent = 'Upload gagal.'; }
+    }
   };
-  request.onerror = () => { progress.hidden = true; status.textContent = 'Upload gagal.'; }; request.send(file);
+  request.onerror = () => {
+    progress.hidden = true;
+    status.textContent = 'Upload gagal.';
+  };
+  request.send(file);
 });
+
 $('#url-form').addEventListener('submit', async event => {
   event.preventDefault(); const status = $('#url-status'); status.textContent = 'Menambahkan…';
   try {
-    await api('/api/videos/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: $('#video-url').value, title: $('#url-title').value, category: $('#url-category').value || 'Umum' }) });
+    await api('/api/videos/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: $('#video-url').value, title: $('#url-title').value, category: $('#url-category').value || 'Umum' , mediaType: state.adminMediaType }) });
     event.target.reset(); status.textContent = ''; $('#upload-dialog').close(); $('#admin-status').textContent = 'Download URL dimulai di background.'; state.page = 1; await loadAdminVideos();
   } catch (error) { status.textContent = error.message; }
 });
@@ -870,6 +1155,16 @@ $('#manage-convert').addEventListener('click', async () => {
   try { await api(`/api/videos/${video.id}/convert`, { method: 'POST' }); $('#metadata-dialog').close(); $('#admin-status').textContent = 'Konversi dimulai.'; await loadAdminVideos(); }
   catch (error) { $('#metadata-status').textContent = error.message; }
 });
+$('#manage-optimize').addEventListener('click', async () => {
+  const image = state.manageVideo;
+  if (!image || image.mediaType !== 'image') return;
+  try {
+    await api(`/api/videos/${image.id}/optimize`, { method: 'POST' });
+    $('#metadata-dialog').close();
+    $('#admin-status').textContent = 'Optimasi gambar dimulai.';
+    await loadAdminVideos();
+  } catch (error) { $('#metadata-status').textContent = error.message; }
+});
 $('#manage-original').addEventListener('click', async () => {
   const video = state.manageVideo; if (!video || !confirm('Hapus MP4 asli? Versi HLS tetap ditayangkan.')) return;
   try { await api(`/api/videos/${video.id}/original`, { method: 'DELETE' }); $('#metadata-dialog').close(); $('#admin-status').textContent = 'MP4 asli dihapus.'; await loadAdminVideos(); }
@@ -877,7 +1172,7 @@ $('#manage-original').addEventListener('click', async () => {
 });
 $('#manage-delete').addEventListener('click', async () => {
   const video = state.manageVideo; if (!video || !confirm(`Hapus “${video.title}” beserta seluruh berkasnya?`)) return;
-  try { await api(`/api/videos/${video.id}`, { method: 'DELETE' }); $('#metadata-dialog').close(); $('#admin-status').textContent = 'Video dihapus.'; await loadAdminVideos(); }
+  try { await api(`/api/videos/${video.id}`, { method: 'DELETE' }); $('#metadata-dialog').close(); $('#admin-status').textContent = `${video.mediaType === 'image' ? 'Gambar' : 'Video'} dihapus.`; await loadAdminVideos(); }
   catch (error) { $('#metadata-status').textContent = error.message; }
 });
 
