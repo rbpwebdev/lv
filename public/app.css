@@ -111,7 +111,10 @@ textarea { min-height: 80px; resize: vertical; }
 .video-card:fullscreen .player-rail { right: max(14px, calc(50% - 280px)); bottom: 92px; }
 .video-card:fullscreen .meta { left: max(17px, calc(50% - 277px)); right: max(78px, calc(50% - 216px)); bottom: 90px; }
 .video-card:fullscreen .timeline { left: max(16px, calc(50% - 278px)); right: max(16px, calc(50% - 278px)); bottom: 40px; }
-.tap-badge, .buffer-ring { position: absolute; z-index: 5; top: 50%; left: 50%; transform: translate(-50%, -50%); pointer-events: none; }
+.tap-badge, .buffer-ring { position: absolute; z-index: 5; top: 50%; left: 50%; pointer-events: none; }
+.tap-badge { transform: translate(-50%, -50%); }
+/* Ring pakai properti translate supaya rotasi spin berporos di tengahnya sendiri. */
+.buffer-ring { translate: -50% -50%; }
 .tap-badge { display: grid; place-items: center; width: 76px; height: 76px; border-radius: 50%; background: rgba(10,10,10,.42); color: #fff; opacity: 0; backdrop-filter: blur(6px); }
 .tap-badge svg { width: 32px; height: 32px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .tap-badge svg .solid { fill: currentColor; }
@@ -141,7 +144,8 @@ textarea { min-height: 80px; resize: vertical; }
 .feed-refresh.armed .feed-refresh-ring { border-top-color: var(--cyan); }
 .feed-refresh.spinning { --pull: 1; opacity: 1; transform: translate(-50%, 16px) scale(1); }
 .feed-refresh.spinning .feed-refresh-ring { border-top-color: var(--cyan); animation: spin .7s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
+/* Memutar lewat properti rotate supaya transform pemosisian ring tidak ikut teranimasi. */
+@keyframes spin { from { rotate: 0deg; } to { rotate: 360deg; } }
 .feed-intro { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(4,4,4,.86); opacity: 0; transition: opacity .32s ease; backdrop-filter: blur(14px); }
 .feed-intro.visible { opacity: 1; }
 .feed-intro-card { width: min(360px, 100%); display: grid; justify-items: center; gap: 4px; text-align: center; transform: translateY(10px) scale(.98); transition: transform .32s cubic-bezier(.2,.8,.2,1); }
