@@ -16,6 +16,20 @@ Gambar feed yang dikirim lewat FTP diletakkan di:
 data/images/
 ```
 
+Service aplikasi berjalan sebagai user `rbp`. Direktori media harus tetap dimiliki
+dan dapat ditulis oleh user tersebut agar proses sync dapat mengganti nama serta
+mengoptimasi berkas:
+
+```sh
+chown rbp:rbp data/uploads data/images data/thumbnails data/hls
+chmod 750 data/uploads data/images data/thumbnails data/hls
+```
+
+Berkas yang dikirim melalui SFTP boleh dimiliki `root`, selama dapat dibaca oleh
+`rbp` (misalnya mode `0644`). Ownership berkas tidak menghalangi sync karena proses
+rename menggunakan izin direktori. Jangan hapus lalu membuat ulang direktori media
+sebagai `root`; unggah berkas ke dalam direktori yang sudah ada.
+
 Di panel admin, pilih tab **Video** atau **Gambar**, lalu tekan tombol Sync pada tab tersebut. Video mendukung MP4, WebM, MOV, dan TS. Gambar mendukung JPG, PNG, dan WebP.
 
 Upload dari panel admin juga mengikuti tab aktif, sehingga file video tidak masuk daftar Gambar dan sebaliknya.
