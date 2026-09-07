@@ -1,5 +1,5 @@
 const $ = selector => document.querySelector(selector);
-const state = { user: null, videos: [], homeVideos: [], homePagination: null, homeLoadId: 0, viewerPage: 1, viewerPagination: null, viewerCategory: '', viewerQuery: '', viewerSeed: 0, viewerSince: 0, viewerStartId: 0, viewerLoading: false, viewerLoadId: 0, viewerMediaType: 'video', searchMediaType: 'video', adminMediaType: 'video', feedReady: false, feedIntroTimer: null, lapStart: 0, feedEnded: false, searchQuery: '', searchVideos: [], searchPage: 1, searchPagination: null, searchLoading: false, searchLoadId: 0, searchTimer: null, adminTimer: null, adminSearchTimer: null, adminLoadId: 0, adminFilters: { q: '', category: '', status: '', sort: 'newest' }, page: 1, pagination: null, manageVideo: null, uploadFile: null, route: '', muted: readStore('lv-muted') !== '0' };
+const state = { user: null, videos: [], homeVideos: [], homePagination: null, homeLoadId: 0, viewerPage: 1, viewerPagination: null, viewerCategory: '', viewerQuery: '', viewerSeed: 0, viewerSince: 0, viewerStartId: 0, viewerLoading: false, viewerLoadId: 0, viewerMediaType: 'video', searchMediaType: 'video', adminMediaType: 'video', feedReady: false, feedIntroTimer: null, lapStart: 0, feedEnded: false, searchQuery: '', searchVideos: [], searchPage: 1, searchPagination: null, searchLoading: false, searchLoadId: 0, searchTimer: null, adminTimer: null, adminSearchTimer: null, adminLoadId: 0, adminFilters: { q: '', category: '', status: '', sort: 'newest' }, page: 1, pagination: null, manageVideo: null, uploadFile: null, uploading: false, storage: null, storageTimer: null, storageFormDirty: false, route: '', muted: readStore('lv-muted') !== '0' };
 const reportedViews = new Set();
 const streams = new WeakMap();
 const feedVideos = new WeakMap();
@@ -23,8 +23,8 @@ function formatTime(value) {
 }
 
 function formatBytes(value) {
-  if (!value) return '—';
-  const units = ['B', 'KB', 'MB', 'GB']; let size = Number(value); let unit = 0;
+  if (!Number.isFinite(Number(value))) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']; let size = Math.max(0, Number(value)); let unit = 0;
   while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1; }
   return `${size.toFixed(unit > 1 ? 1 : 0)} ${units[unit]}`;
 }
@@ -83,7 +83,7 @@ function navigate(path, params = {}, { replace = false } = {}) {
 let leavingTimer = null;
 // Layar lama ditahan sebentar sambil memudar supaya perpindahan tidak terasa dihempas.
 function showTopSection(name) {
-  clearTimeout(state.adminTimer); clearTimeout(leavingTimer);
+  clearTimeout(state.adminTimer); clearTimeout(state.storageTimer); clearTimeout(leavingTimer);
   const sections = { landing: $('#home'), login: $('#login'), viewer: $('#viewer'), admin: $('#admin') };
   const target = sections[name];
   const leaving = Object.values(sections).find(node => !node.hidden && node !== target && !node.classList.contains('leaving'));
@@ -164,7 +164,7 @@ async function showAdmin() {
   api('/api/settings')
     .then(({ feedMode }) => { $('#feed-mode').value = feedMode; })
     .catch(error => { $('#admin-status').textContent = `Setelan feed tidak terbaca: ${error.message}`; });
-  await loadAdminVideos();
+  await Promise.all([loadAdminVideos(), loadStorage()]);
 }
 
 function showLanding() {
@@ -700,6 +700,75 @@ function showProfile() {
   releaseFeed(); hideIntro(); showViewerSection('profile');
 }
 
+function storageGiB(value) {
+  return Number((Number(value || 0) / (1024 ** 3)).toFixed(2));
+}
+
+function storageGiBMaximum(value) {
+  return Math.floor(Number(value || 0) / (1024 ** 3) * 100) / 100;
+}
+
+function updateStorageModeFields() {
+  $('#storage-custom-field').hidden = $('#storage-mode').value !== 'custom';
+}
+
+function updateUploadControls() {
+  if (!state.storage || state.uploading) return;
+  const capacity = Number(state.storage.uploadCapacityBytes || 0);
+  const file = state.uploadFile || $('#video-file').files[0];
+  const canFitFile = state.storage.acceptingUploads && (!file || file.size <= capacity);
+  const remoteMaximum = state.adminMediaType === 'image'
+    ? state.storage.limits.imageBytes
+    : state.storage.limits.videoBytes;
+  $('#upload-open').disabled = !state.storage.acceptingUploads;
+  $('#upload-submit').disabled = !canFitFile;
+  $('#url-submit').disabled = capacity < remoteMaximum;
+  $('#upload-open').title = state.storage.acceptingUploads ? '' : 'Ruang aman penyimpanan sudah habis.';
+  $('#url-submit').title = capacity >= remoteMaximum ? '' : `Download URL membutuhkan ruang aman ${formatBytes(remoteMaximum)}.`;
+  if (file && !canFitFile) $('#upload-status').textContent = `Ruang aman tersisa ${formatBytes(capacity)}; file ini berukuran ${formatBytes(file.size)}.`;
+}
+
+function renderStorage(storage) {
+  state.storage = storage;
+  const custom = storage.mode === 'custom';
+  const value = custom ? storage.projectUsedBytes : storage.usedBytes;
+  const maximum = custom ? storage.customLimitBytes : storage.totalBytes;
+  const percent = maximum > 0 ? Math.min(100, Math.max(0, value / maximum * 100)) : 100;
+  const labels = { safe: 'Aman', warning: 'Menipis', danger: 'Upload berhenti' };
+  $('#storage-card').dataset.level = storage.level;
+  $('#storage-state').textContent = labels[storage.level] || 'Tidak diketahui';
+  $('#storage-used').style.width = `${percent.toFixed(2)}%`;
+  $('#storage-track').setAttribute('aria-valuenow', String(Math.round(percent)));
+  $('#storage-summary').textContent = custom
+    ? `${formatBytes(storage.projectUsedBytes)} data LV dari batas ${formatBytes(storage.customLimitBytes)}`
+    : `${formatBytes(storage.usedBytes)} terpakai · ${formatBytes(storage.availableBytes)} tersedia dari ${formatBytes(storage.totalBytes)}`;
+  $('#storage-detail').textContent = `Kapasitas upload efektif ${formatBytes(storage.uploadCapacityBytes)}`;
+  const pending = storage.pendingBytes ? ` · ${formatBytes(storage.pendingBytes)} sedang dipesan proses aktif` : '';
+  $('#storage-note').textContent = custom
+    ? `Disk server masih tersedia ${formatBytes(storage.availableBytes)}. Headroom ${formatBytes(storage.headroomBytes)} selalu dilindungi${pending}.`
+    : `Headroom ${formatBytes(storage.headroomBytes)} selalu dilindungi agar server tidak penuh${pending}.`;
+  if (!state.storageFormDirty) {
+    $('#storage-mode').value = storage.mode;
+    $('#storage-limit').value = storageGiB(storage.customLimitBytes);
+  }
+  $('#storage-limit').max = String(storageGiBMaximum(storage.maximumCustomLimitBytes));
+  updateStorageModeFields();
+  updateUploadControls();
+}
+
+async function loadStorage() {
+  clearTimeout(state.storageTimer);
+  try {
+    renderStorage(await api('/api/storage'));
+  } catch (error) {
+    $('#storage-card').dataset.level = 'danger';
+    $('#storage-state').textContent = 'Tidak tersedia';
+    $('#storage-note').textContent = `Kapasitas tidak dapat dibaca: ${error.message}`;
+  } finally {
+    if (!$('#admin').hidden) state.storageTimer = setTimeout(loadStorage, 15000);
+  }
+}
+
 function updateAdminMediaUi() {
   const isImage = state.adminMediaType === 'image';
   $('#admin-type-video').classList.toggle('active', !isImage);
@@ -721,6 +790,7 @@ function updateAdminMediaUi() {
   $('#video-file').accept = isImage
     ? 'image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp'
     : 'video/mp4,video/webm,video/quicktime,video/mp2t,.ts';
+  updateUploadControls();
 }
 
 async function switchAdminMediaType(mediaType) {
@@ -927,6 +997,7 @@ async function logout() { await api('/api/logout', { method: 'POST' }); state.us
 const routeError = error => { $('#viewer-search-empty').textContent = error.message; $('#viewer-search-empty').hidden = false; };
 $('#profile-logout').addEventListener('click', logout); $('#admin-logout').addEventListener('click', logout);
 $('#admin-home').addEventListener('click', () => navigate('/'));
+$('#admin-settings').addEventListener('click', () => { $('#settings-dialog').showModal(); loadStorage(); });
 $('#admin-type-video').addEventListener('click', () => switchAdminMediaType('video').catch(error => { $('#admin-status').textContent = error.message; }));
 $('#admin-type-image').addEventListener('click', () => switchAdminMediaType('image').catch(error => { $('#admin-status').textContent = error.message; }));
 $('#home-enter').addEventListener('click', () => navigate(landingPath())); $('#home-primary').addEventListener('click', () => navigate(landingPath()));
@@ -1009,6 +1080,32 @@ function selectAddTab(tab) {
   const upload = tab === 'upload';
   $('#upload-form').hidden = !upload; $('#url-form').hidden = upload; $('#upload-tab').classList.toggle('active', upload); $('#url-tab').classList.toggle('active', !upload);
 }
+$('#storage-mode').addEventListener('change', () => {
+  state.storageFormDirty = true;
+  updateStorageModeFields();
+});
+$('#storage-limit').addEventListener('input', () => { state.storageFormDirty = true; });
+$('#storage-settings').addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = $('#storage-save');
+  const status = $('#storage-settings-status');
+  const mode = $('#storage-mode').value;
+  const body = { mode };
+  if (mode === 'custom') {
+    const limitGiB = Number($('#storage-limit').value);
+    if (!Number.isFinite(limitGiB) || limitGiB <= 0) { status.textContent = 'Masukkan batas proyek lebih dari 0 GB.'; return; }
+    body.customLimitBytes = Math.round(limitGiB * (1024 ** 3));
+  }
+  button.disabled = true;
+  status.textContent = 'Menyimpan…';
+  try {
+    const storage = await api('/api/storage', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    state.storageFormDirty = false;
+    renderStorage(storage);
+    status.textContent = mode === 'custom' ? 'Batas proyek diterapkan.' : 'Batas otomatis server diterapkan.';
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
+});
 $('#upload-open').addEventListener('click', () => { selectAddTab('upload'); $('#upload-dialog').showModal(); });
 $('#upload-tab').addEventListener('click', () => selectAddTab('upload'));
 $('#url-tab').addEventListener('click', () => selectAddTab('url'));
@@ -1026,12 +1123,14 @@ function setUploadFile(file) {
     $('#upload-status').textContent = state.adminMediaType === 'image'
       ? 'Gunakan JPG, PNG, atau WebP.'
       : 'Gunakan MP4, WebM, MOV, atau TS.';
+    updateUploadControls();
     return false;
   }
   state.uploadFile = file || null;
   $('#drop-file').textContent = file ? `${file.name} · ${formatBytes(file.size)}` : 'atau klik untuk memilih';
   $('#dropzone').classList.toggle('has-file', Boolean(file));
   if (file) $('#upload-status').textContent = '';
+  updateUploadControls();
   return true;
 }
 $('#dropzone').addEventListener('click', () => $('#video-file').click());
@@ -1064,7 +1163,7 @@ $('#sync-videos').addEventListener('click', async () => {
   try {
     const result = await api(`/api/videos/sync?type=${state.adminMediaType}`, { method: 'POST' });
     status.textContent = `Sync: ${result.added} baru, ${result.existing} sudah ada, ${result.skipped} dilewati.`;
-    state.page = 1; await loadAdminVideos();
+    state.page = 1; await Promise.all([loadAdminVideos(), loadStorage()]);
   } catch (error) { status.textContent = error.message; }
 });
 $('#upload-form').addEventListener('submit', event => {
@@ -1091,6 +1190,8 @@ $('#upload-form').addEventListener('submit', event => {
   const request = new XMLHttpRequest();
   request.open('POST', `/api/videos/upload?${query}`);
   request.setRequestHeader('Content-Type', file.type || fallbackTypes[extension]);
+  state.uploading = true;
+  $('#upload-submit').disabled = true;
   progress.hidden = false;
   status.textContent = 'Mengunggah 0%';
   request.upload.onprogress = uploadEvent => {
@@ -1100,21 +1201,27 @@ $('#upload-form').addEventListener('submit', event => {
     status.textContent = `Mengunggah ${percent}%`;
   };
   request.onload = async () => {
+    state.uploading = false;
     progress.hidden = true;
     if (request.status >= 200 && request.status < 300) {
       event.target.reset(); setUploadFile(null); status.textContent = '';
       $('#upload-dialog').close();
       $('#admin-status').textContent = `${mediaType === 'image' ? 'Gambar' : 'Video'} ditambahkan.`;
       state.page = 1;
-      await loadAdminVideos();
+      await Promise.all([loadAdminVideos(), loadStorage()]);
     } else {
       try { status.textContent = JSON.parse(request.responseText).error; }
       catch { status.textContent = 'Upload gagal.'; }
+      await loadStorage();
     }
+    updateUploadControls();
   };
   request.onerror = () => {
+    state.uploading = false;
     progress.hidden = true;
     status.textContent = 'Upload gagal.';
+    updateUploadControls();
+    loadStorage();
   };
   request.send(file);
 });
@@ -1123,7 +1230,7 @@ $('#url-form').addEventListener('submit', async event => {
   event.preventDefault(); const status = $('#url-status'); status.textContent = 'Menambahkan…';
   try {
     await api('/api/videos/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: $('#video-url').value, title: $('#url-title').value, category: $('#url-category').value || 'Umum' , mediaType: state.adminMediaType }) });
-    event.target.reset(); status.textContent = ''; $('#upload-dialog').close(); $('#admin-status').textContent = 'Download URL dimulai di background.'; state.page = 1; await loadAdminVideos();
+    event.target.reset(); status.textContent = ''; $('#upload-dialog').close(); $('#admin-status').textContent = 'Download URL dimulai di background.'; state.page = 1; await Promise.all([loadAdminVideos(), loadStorage()]);
   } catch (error) { status.textContent = error.message; }
 });
 $('#metadata-form').addEventListener('submit', async event => {
@@ -1132,7 +1239,7 @@ $('#metadata-form').addEventListener('submit', async event => {
     await api(`/api/videos/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: $('#metadata-title').value, category: $('#metadata-category').value, caption: $('#metadata-caption').value }) });
     const image = $('#metadata-thumbnail').files[0];
     if (image) await api(`/api/videos/${id}/thumbnail`, { method: 'POST', headers: { 'Content-Type': image.type }, body: image });
-    status.textContent = ''; $('#metadata-dialog').close(); $('#admin-status').textContent = 'Metadata diperbarui.'; await loadAdminVideos();
+    status.textContent = ''; $('#metadata-dialog').close(); $('#admin-status').textContent = 'Metadata diperbarui.'; await Promise.all([loadAdminVideos(), loadStorage()]);
   } catch (error) { status.textContent = error.message; }
 });
 $('#frame-time').addEventListener('input', () => { const time = Number($('#frame-time').value); $('#frame-video').currentTime = time; $('#frame-clock').textContent = formatTime(time); });
@@ -1143,7 +1250,7 @@ $('#frame-capture').addEventListener('click', async () => {
   const ticker = setInterval(() => { percent = Math.min(92, percent + Math.max(1, Math.round((94 - percent) * .12))); status.textContent = `Mengambil frame ${percent}%`; }, 160);
   try {
     const result = await api(`/api/videos/${video.id}/thumbnail/frame`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ time: $('#frame-video').currentTime || Number($('#frame-time').value) || 0 }) });
-    clearInterval(ticker); $('#metadata-preview').src = result.thumbnail; $('#metadata-preview').hidden = false; status.textContent = 'Mengambil frame 100%'; await loadAdminVideos();
+    clearInterval(ticker); $('#metadata-preview').src = result.thumbnail; $('#metadata-preview').hidden = false; status.textContent = 'Mengambil frame 100%'; await Promise.all([loadAdminVideos(), loadStorage()]);
   } catch (error) { clearInterval(ticker); status.textContent = error.message; }
 });
 $('#manage-preview').addEventListener('click', () => {
@@ -1152,7 +1259,7 @@ $('#manage-preview').addEventListener('click', () => {
 });
 $('#manage-convert').addEventListener('click', async () => {
   const video = state.manageVideo; if (!video) return;
-  try { await api(`/api/videos/${video.id}/convert`, { method: 'POST' }); $('#metadata-dialog').close(); $('#admin-status').textContent = 'Konversi dimulai.'; await loadAdminVideos(); }
+  try { await api(`/api/videos/${video.id}/convert`, { method: 'POST' }); $('#metadata-dialog').close(); $('#admin-status').textContent = 'Konversi dimulai.'; await Promise.all([loadAdminVideos(), loadStorage()]); }
   catch (error) { $('#metadata-status').textContent = error.message; }
 });
 $('#manage-optimize').addEventListener('click', async () => {
@@ -1162,17 +1269,17 @@ $('#manage-optimize').addEventListener('click', async () => {
     await api(`/api/videos/${image.id}/optimize`, { method: 'POST' });
     $('#metadata-dialog').close();
     $('#admin-status').textContent = 'Optimasi gambar dimulai.';
-    await loadAdminVideos();
+    await Promise.all([loadAdminVideos(), loadStorage()]);
   } catch (error) { $('#metadata-status').textContent = error.message; }
 });
 $('#manage-original').addEventListener('click', async () => {
   const video = state.manageVideo; if (!video || !confirm('Hapus MP4 asli? Versi HLS tetap ditayangkan.')) return;
-  try { await api(`/api/videos/${video.id}/original`, { method: 'DELETE' }); $('#metadata-dialog').close(); $('#admin-status').textContent = 'MP4 asli dihapus.'; await loadAdminVideos(); }
+  try { await api(`/api/videos/${video.id}/original`, { method: 'DELETE' }); $('#metadata-dialog').close(); $('#admin-status').textContent = 'MP4 asli dihapus.'; await Promise.all([loadAdminVideos(), loadStorage()]); }
   catch (error) { $('#metadata-status').textContent = error.message; }
 });
 $('#manage-delete').addEventListener('click', async () => {
   const video = state.manageVideo; if (!video || !confirm(`Hapus “${video.title}” beserta seluruh berkasnya?`)) return;
-  try { await api(`/api/videos/${video.id}`, { method: 'DELETE' }); $('#metadata-dialog').close(); $('#admin-status').textContent = `${video.mediaType === 'image' ? 'Gambar' : 'Video'} dihapus.`; await loadAdminVideos(); }
+  try { await api(`/api/videos/${video.id}`, { method: 'DELETE' }); $('#metadata-dialog').close(); $('#admin-status').textContent = `${video.mediaType === 'image' ? 'Gambar' : 'Video'} dihapus.`; await Promise.all([loadAdminVideos(), loadStorage()]); }
   catch (error) { $('#metadata-status').textContent = error.message; }
 });
 

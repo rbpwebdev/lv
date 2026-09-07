@@ -107,7 +107,7 @@
   </main>
 
   <main id="admin" class="admin" hidden>
-    <nav class="admin-nav"><span class="nav-start"><span class="brand">LV</span><button id="admin-home" class="nav-link" type="button">Home</button></span><button id="admin-logout">Keluar</button></nav>
+    <nav class="admin-nav"><span class="nav-start"><span class="brand">LV</span><button id="admin-home" class="nav-link" type="button">Home</button></span><span class="admin-nav-actions"><button id="admin-settings" type="button">Pengaturan</button><button id="admin-logout">Keluar</button></span></nav>
     <section class="admin-shell">
       <p id="admin-status" class="admin-message" aria-live="polite"></p>
       <nav class="content-tabs admin-media-tabs" aria-label="Jenis konten">
@@ -117,10 +117,6 @@
       <div class="list-head">
         <strong id="admin-media-title">Video <span id="video-count">0</span></strong>
         <span class="list-actions">
-          <select id="feed-mode" aria-label="Mode feed pengguna">
-            <option value="fyp">Feed: FYP</option>
-            <option value="shuffle">Feed: Acak</option>
-          </select>
           <button id="sync-videos" type="button">Sync</button><button id="upload-open" class="add-button" type="button" aria-label="Tambah media">+</button>
         </span>
       </div>
@@ -152,6 +148,45 @@
     </section>
   </main>
 
+  <dialog id="settings-dialog" class="settings-dialog">
+    <form method="dialog" class="dialog-head"><strong>Pengaturan</strong><button class="icon-button" aria-label="Tutup">×</button></form>
+    <section class="settings-section">
+      <label>Mode feed pengguna
+        <select id="feed-mode" aria-label="Mode feed pengguna">
+          <option value="fyp">FYP</option>
+          <option value="shuffle">Acak</option>
+        </select>
+      </label>
+    </section>
+    <section id="storage-card" class="storage-card" data-level="safe" aria-labelledby="storage-title">
+      <header class="storage-head">
+        <span><small>Kapasitas media</small><strong id="storage-title">Penyimpanan</strong></span>
+        <span id="storage-state" class="storage-state">Memuat…</span>
+      </header>
+      <div id="storage-track" class="storage-track" role="progressbar" aria-label="Kapasitas penyimpanan terpakai" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <span id="storage-used" class="storage-used"></span>
+      </div>
+      <div class="storage-meta">
+        <strong id="storage-summary">Membaca kapasitas server…</strong>
+        <span id="storage-detail"></span>
+      </div>
+      <p id="storage-note" class="storage-note">Upload akan berhenti sebelum ruang aman server terpakai.</p>
+      <form id="storage-settings" class="storage-settings">
+        <label>Dasar batas
+          <select id="storage-mode">
+            <option value="filesystem">Otomatis · kapasitas server</option>
+            <option value="custom">Batas proyek sendiri</option>
+          </select>
+        </label>
+        <label id="storage-custom-field" hidden>Batas data LV (GB)
+          <input id="storage-limit" type="number" min="0.01" step="0.01" inputmode="decimal">
+        </label>
+        <button id="storage-save" type="submit">Terapkan</button>
+      </form>
+      <p id="storage-settings-status" class="storage-settings-status" aria-live="polite"></p>
+    </section>
+  </dialog>
+
   <dialog id="upload-dialog">
     <form method="dialog" class="dialog-head"><strong id="upload-dialog-title">Tambah media</strong><button class="icon-button" aria-label="Tutup">×</button></form>
     <nav class="modal-tabs"><button id="upload-tab" class="active" type="button">Upload</button><button id="url-tab" type="button">URL</button></nav>
@@ -173,7 +208,7 @@
       <input id="video-url" type="url" inputmode="url" placeholder="https://…/media" required>
       <input id="url-title" placeholder="Judul media" maxlength="120">
       <input id="url-category" placeholder="Kategori: Musik, Live" maxlength="240">
-      <button type="submit">Tambah URL</button>
+      <button id="url-submit" type="submit">Tambah URL</button>
       <p id="url-status" class="muted" aria-live="polite"></p>
     </form>
   </dialog>

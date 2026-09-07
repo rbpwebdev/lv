@@ -34,6 +34,22 @@ Di panel admin, pilih tab **Video** atau **Gambar**, lalu tekan tombol Sync pada
 
 Upload dari panel admin juga mengikuti tab aktif, sehingga file video tidak masuk daftar Gambar dan sebaliknya.
 
+## Batas penyimpanan
+
+Panel admin menampilkan kapasitas penyimpanan sebagai bar dan menyediakan dua mode batas:
+
+- **Otomatis · kapasitas server** memakai ruang disk tempat `LV_DATA_DIR` berada.
+- **Batas proyek sendiri** membatasi total data LV pada nilai yang ditentukan admin.
+
+Kedua mode selalu melindungi headroom disk server. Secara default headroom dihitung dari
+ukuran disk (target 5%, minimal 1 GiB, maksimal 10 GiB; disk kecil menyisakan 20%).
+Nilainya dapat ditetapkan oleh operator dalam byte melalui `LV_DISK_HEADROOM_BYTES`.
+Kuota custom tidak dapat disimpan melebihi kapasitas disk setelah headroom.
+
+Upload browser, download media dari URL, dan konversi video akan ditolak dengan status
+HTTP `507` jika ruang aman tidak mencukupi. Proses yang sedang berjalan juga memesan
+kapasitas agar beberapa upload bersamaan tidak melampaui batas.
+
 ## Optimasi gambar
 
 Gambar baru otomatis dioptimasi di background. Berkas yang lebih besar dari 500 KB dikonversi ke WebP, metadata dibuang, dan sisi terpanjang dibatasi secara bertahap sampai ukurannya maksimal 500 KB. Gambar yang sudah di bawah 500 KB tidak dikompresi ulang; thumbnail feed tetap dibuat.

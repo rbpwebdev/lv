@@ -22,6 +22,9 @@ const hlsDir = path.join(dataDir, 'hls');
 const maxUpload = 500 * 1024 * 1024;
 const maxImageUpload = 25 * 1024 * 1024;
 const maxOptimizedImage = 500 * 1024;
+const gibibyte = 1024 ** 3;
+const configuredHeadroom = Number.parseInt(process.env.LV_DISK_HEADROOM_BYTES || '', 10);
+const storageReservations = new Map();
 fs.mkdirSync(uploadDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(imageDir, { recursive: true, mode: 0o750 });
 fs.mkdirSync(thumbnailDir, { recursive: true, mode: 0o750 });
@@ -69,6 +72,93 @@ const publicMediaVisibility = "videos.ingest_status='ready' AND ((videos.media_t
 function feedMode() {
   const row = db.prepare("SELECT value FROM settings WHERE key='feed_mode'").get();
   return feedModes.includes(row?.value) ? row.value : 'fyp';
+}
+
+function dataUsageBytes() {
+  const directories = [dataDir];
+  let total = 0;
+  while (directories.length) {
+    const directory = directories.pop();
+    let entries;
+    try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    for (const entry of entries) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) directories.push(target);
+      else if (entry.isFile()) {
+        try { total += fs.statSync(target).size; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
+    }
+  }
+  return total;
+}
+
+function diskHeadroomBytes(totalBytes) {
+  if (Number.isSafeInteger(configuredHeadroom) && configuredHeadroom >= 0) {
+    return Math.min(configuredHeadroom, Math.floor(totalBytes * 0.9));
+  }
+  // Default: 5%, minimal 1 GiB, maksimal 10 GiB. Disk kecil menyisakan 20%.
+  return Math.floor(Math.min(10 * gibibyte, Math.max(gibibyte, totalBytes * 0.05), totalBytes * 0.2));
+}
+
+function storageSnapshot() {
+  const stat = fs.statfsSync(dataDir, { bigint: true });
+  const totalBytes = Number(stat.bsize * stat.blocks);
+  const availableBytes = Number(stat.bsize * stat.bavail);
+  const usedBytes = Math.max(0, totalBytes - availableBytes);
+  const projectUsedBytes = dataUsageBytes();
+  const headroomBytes = diskHeadroomBytes(totalBytes);
+  const maximumCustomLimitBytes = Math.max(0, totalBytes - headroomBytes);
+  const modeRow = db.prepare("SELECT value FROM settings WHERE key='storage_limit_mode'").get();
+  const mode = modeRow?.value === 'custom' ? 'custom' : 'filesystem';
+  const customRow = db.prepare("SELECT value FROM settings WHERE key='storage_custom_limit_bytes'").get();
+  const savedCustomLimit = Number(customRow?.value);
+  const customLimitBytes = Number.isSafeInteger(savedCustomLimit) && savedCustomLimit > 0
+    ? Math.min(savedCustomLimit, maximumCustomLimitBytes)
+    : maximumCustomLimitBytes;
+  const pendingBytes = [...storageReservations.values()].reduce((sum, value) => sum + value, 0);
+  const safeDiskRemaining = Math.max(0, availableBytes - headroomBytes);
+  const quotaRemaining = mode === 'custom'
+    ? Math.max(0, customLimitBytes - projectUsedBytes)
+    : Number.MAX_SAFE_INTEGER;
+  const uploadCapacityBytes = Math.max(0, Math.min(safeDiskRemaining, quotaRemaining) - pendingBytes);
+  const referenceBytes = mode === 'custom' ? customLimitBytes : totalBytes;
+  const warningThreshold = Math.max(maxUpload, referenceBytes * 0.1);
+  const level = uploadCapacityBytes <= 0 ? 'danger' : uploadCapacityBytes <= warningThreshold ? 'warning' : 'safe';
+  return {
+    mode,
+    totalBytes,
+    usedBytes,
+    availableBytes,
+    projectUsedBytes,
+    headroomBytes,
+    customLimitBytes,
+    maximumCustomLimitBytes,
+    pendingBytes,
+    uploadCapacityBytes,
+    acceptingUploads: uploadCapacityBytes > 0,
+    level,
+    limits: { videoBytes: maxUpload, imageBytes: maxImageUpload }
+  };
+}
+
+function reserveStorage(bytes) {
+  const requiredBytes = Math.max(0, Math.ceil(Number(bytes) || 0));
+  const snapshot = storageSnapshot();
+  if (!requiredBytes || requiredBytes > snapshot.uploadCapacityBytes) return null;
+  const token = Symbol('storage-reservation');
+  storageReservations.set(token, requiredBytes);
+  return token;
+}
+
+function releaseStorage(token) {
+  if (token) storageReservations.delete(token);
+}
+
+function insufficientStorageMessage() {
+  return 'Ruang penyimpanan aman tidak cukup. Kosongkan media atau naikkan batas proyek.';
 }
 
 const feedPrime = 2147483647;
@@ -409,7 +499,7 @@ async function fetchRemote(value, signal, redirects = 0) {
   if (!response.ok || !response.body) throw new Error(`Server sumber merespons ${response.status}.`);
   return { response, finalUrl: url.href };
 }
-async function downloadRemote(row, sourceUrl) {
+async function downloadRemote(row, sourceUrl, storageReservation) {
   const id = Number(row.id);
   const job = { progress: 0, controller: new AbortController() };
   remoteJobs.set(id, job);
@@ -475,9 +565,11 @@ async function downloadRemote(row, sourceUrl) {
     output?.destroy();
     fs.rmSync(temporary, { force: true });
     if (db.prepare('SELECT 1 FROM videos WHERE id=?').get(id)) {
-      db.prepare("UPDATE videos SET ingest_status='failed', ingest_error=? WHERE id=?").run((error.name === 'AbortError' ? 'Download dibatalkan.' : error.message).slice(0, 500), id);
+      const detail = error.code === 'ENOSPC' ? insufficientStorageMessage() : error.name === 'AbortError' ? 'Download dibatalkan.' : error.message;
+      db.prepare("UPDATE videos SET ingest_status='failed', ingest_error=? WHERE id=?").run(detail.slice(0, 500), id);
     }
   } finally {
+    releaseStorage(storageReservation);
     remoteJobs.delete(id);
   }
 }
@@ -541,6 +633,8 @@ async function upload(req, res, url) {
   if (!detail) return json(res, 415, { error: 'Gunakan MP4, WebM, MOV, TS, JPG, PNG, atau WebP.' });
   const limit = detail.mediaType === 'image' ? maxImageUpload : maxUpload;
   if (!length || length > limit) return json(res, 413, { error: `Ukuran maksimum ${detail.mediaType === 'image' ? '25 MB' : '500 MB'}.` });
+  const storageReservation = reserveStorage(length);
+  if (!storageReservation) return json(res, 507, { error: insufficientStorageMessage() });
 
   const filename = `${crypto.randomUUID()}${detail.extension}`;
   const target = path.join(detail.mediaType === 'image' ? imageDir : uploadDir, filename);
@@ -571,8 +665,9 @@ async function upload(req, res, url) {
   } catch (error) {
     output.destroy();
     fs.rmSync(target, { force: true });
-    json(res, error.message === 'TOO_LARGE' ? 413 : 500, { error: 'Upload gagal.' });
-  }
+    const status = error.message === 'TOO_LARGE' ? 413 : error.code === 'ENOSPC' ? 507 : 500;
+    json(res, status, { error: status === 507 ? insufficientStorageMessage() : 'Upload gagal.' });
+  } finally { releaseStorage(storageReservation); }
 }
 
 async function replaceThumbnail(req, res, id) {
@@ -627,7 +722,7 @@ async function captureThumbnail(req, res, id) {
   }
 }
 
-function runConversion(row) {
+function runConversion(row, storageReservation) {
   const id = Number(row.id);
   const input = path.join(uploadDir, path.basename(row.source));
   const workingDir = path.join(hlsDir, `${id}.working`);
@@ -635,7 +730,7 @@ function runConversion(row) {
   fs.rmSync(workingDir, { recursive: true, force: true });
   fs.mkdirSync(workingDir, { recursive: true, mode: 0o750 });
   db.prepare("UPDATE videos SET conversion_status='converting', conversion_error=NULL WHERE id=?").run(id);
-  const job = { progress: 0, process: null };
+  const job = { progress: 0, process: null, storageReservation };
   conversionJobs.set(id, job);
   const args = [
     '-y', '-i', input, '-threads', '1',
@@ -659,6 +754,7 @@ function runConversion(row) {
   child.on('error', error => {
     fs.rmSync(workingDir, { recursive: true, force: true });
     db.prepare("UPDATE videos SET conversion_status='failed', conversion_error=? WHERE id=?").run(error.message.slice(0, 500), id);
+    releaseStorage(storageReservation);
     conversionJobs.delete(id);
   });
   child.on('close', code => {
@@ -671,6 +767,7 @@ function runConversion(row) {
       const detail = stderr.split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 500) || `ffmpeg keluar dengan kode ${code}`;
       db.prepare("UPDATE videos SET conversion_status='failed', conversion_error=? WHERE id=?").run(detail, id);
     }
+    releaseStorage(storageReservation);
     conversionJobs.delete(id);
   });
 }
@@ -709,6 +806,28 @@ async function route(req, res) {
       if (!feedModes.includes(body.feedMode)) return json(res, 400, { error: 'Mode feed tidak dikenal.' });
       db.prepare("INSERT INTO settings (key,value) VALUES ('feed_mode',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(body.feedMode);
       return json(res, 200, { feedMode: body.feedMode });
+    }
+  }
+  if (url.pathname === '/api/storage') {
+    if (!requireUser(req, res, 'admin')) return;
+    if (req.method === 'GET') return json(res, 200, storageSnapshot());
+    if (req.method === 'PATCH') {
+      const body = await readJson(req);
+      if (!['filesystem', 'custom'].includes(body.mode)) return json(res, 400, { error: 'Dasar batas penyimpanan tidak dikenal.' });
+      const current = storageSnapshot();
+      let customLimitBytes = current.customLimitBytes;
+      if (body.mode === 'custom') {
+        customLimitBytes = Math.round(Number(body.customLimitBytes));
+        if (!Number.isSafeInteger(customLimitBytes) || customLimitBytes <= 0) return json(res, 400, { error: 'Batas proyek harus lebih dari 0.' });
+        if (customLimitBytes > current.maximumCustomLimitBytes) return json(res, 400, { error: 'Batas proyek melebihi kapasitas aman disk server.' });
+      }
+      db.exec('BEGIN');
+      try {
+        db.prepare("INSERT INTO settings (key,value) VALUES ('storage_limit_mode',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(body.mode);
+        db.prepare("INSERT INTO settings (key,value) VALUES ('storage_custom_limit_bytes',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(customLimitBytes));
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+      return json(res, 200, storageSnapshot());
     }
   }
   if (req.method === 'GET' && url.pathname === '/api/categories') {
@@ -855,11 +974,15 @@ async function route(req, res) {
     const temporary = `${crypto.randomUUID()}.part`;
     const categories = normalizeCategories(body.categories || body.category);
     const requestedMediaType = body.mediaType === 'image' ? 'image' : 'video';
-    const result = db.prepare("INSERT INTO videos (title,caption,category,source_type,source,sort_order,source_url,ingest_status,media_type,optimization_status) VALUES (?,?,?,?,?,?,?,'downloading',?,?)").run(String(body.title || fallbackTitle).slice(0,120), String(body.caption || '').slice(0,500), categories[0], 'upload', temporary, Date.now(), source.href, requestedMediaType, requestedMediaType === 'image' ? 'unoptimised' : 'none');
-    setVideoCategories(result.lastInsertRowid, categories);
-    const row = db.prepare('SELECT * FROM videos WHERE id=?').get(result.lastInsertRowid);
-    downloadRemote(row, source.href).catch(error => console.error(error));
-    return json(res, 202, cleanVideo(row));
+    const storageReservation = reserveStorage(requestedMediaType === 'image' ? maxImageUpload : maxUpload);
+    if (!storageReservation) return json(res, 507, { error: insufficientStorageMessage() });
+    try {
+      const result = db.prepare("INSERT INTO videos (title,caption,category,source_type,source,sort_order,source_url,ingest_status,media_type,optimization_status) VALUES (?,?,?,?,?,?,?,'downloading',?,?)").run(String(body.title || fallbackTitle).slice(0,120), String(body.caption || '').slice(0,500), categories[0], 'upload', temporary, Date.now(), source.href, requestedMediaType, requestedMediaType === 'image' ? 'unoptimised' : 'none');
+      setVideoCategories(result.lastInsertRowid, categories);
+      const row = db.prepare('SELECT * FROM videos WHERE id=?').get(result.lastInsertRowid);
+      downloadRemote(row, source.href, storageReservation).catch(error => console.error(error));
+      return json(res, 202, cleanVideo(row));
+    } catch (error) { releaseStorage(storageReservation); throw error; }
   }
   const editMatch = /^\/api\/videos\/(\d+)$/.exec(url.pathname);
   if (req.method === 'GET' && editMatch) {
@@ -910,7 +1033,10 @@ async function route(req, res) {
     if (path.extname(row.source).toLowerCase() === '.ts') return json(res, 409, { error: 'Berkas sudah berformat TS.' });
     if (conversionJobs.has(Number(row.id)) || row.conversion_status === 'converting') return json(res, 409, { error: 'Konversi sedang berjalan.' });
     if (row.hls_manifest && row.conversion_status === 'converted') return json(res, 409, { error: 'Video sudah dikonversi.' });
-    runConversion(row);
+    const sourceSize = fs.statSync(path.join(uploadDir, path.basename(row.source))).size;
+    const storageReservation = reserveStorage(Math.ceil(sourceSize * 1.5));
+    if (!storageReservation) return json(res, 507, { error: insufficientStorageMessage() });
+    try { runConversion(row, storageReservation); } catch (error) { releaseStorage(storageReservation); throw error; }
     return json(res, 202, { ok: true });
   }
   const originalMatch = /^\/api\/videos\/(\d+)\/original$/.exec(url.pathname);
